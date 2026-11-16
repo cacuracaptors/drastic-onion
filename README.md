@@ -1,3 +1,10 @@
+> **This fork (branch `onion-dsfast`)** adds **libdsfast** for DraStic on **OnionOS / RedOnion** (Miyoo Mini,
+> Mini Plus, Mini v4, Mini Flip): full speed with every frame drawn in normal scenes and smooth frame pacing,
+> without changing DraStic or steward-fu's SDL2 v1.8. Install, measurements and details:
+> **[onion/README.md](onion/README.md)**. Pre-release: please report how it runs on your device.
+>
+> Everything below is steward-fu's original README.
+
 # NDS Emulator (DraStic) for Miyoo Mini (Plus), TRIMUI SMART, FunKey S, RG Nano and F(x)tec Pro1 (QX1000)
 ![image](images/mmiyoo_640/mm.jpg) ![image](images/mmiyoo_640/mmp.jpg) ![image](images/mmiyoo_752/mm.jpg) ![image](images/trimui_320/trimui.jpg) ![image](images/funkeys_240/funkeys.jpg) ![image](images/funkeys_240/rgnano.jpg) ![image](images/qx1000_1080/pro1.jpg)  
 
