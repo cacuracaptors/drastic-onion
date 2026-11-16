@@ -52,7 +52,7 @@ All details, with the measurements behind each one, are in the comments at the t
 6. **Threads placed on the two cores**: emulation, 2D and flip on core 0; 3D, audio and video on core 1.
 7. **SDL video thread at a higher priority** than the 3D thread on core 1.
 8. **Hidden screen not drawn** in single-screen layouts (and its 3D not rendered when nothing reads it back).
-9. **DraStic menus without lag**.
+9. **DraStic menus with less lag**.
 11. **3D split over both cores** only while the emulation keeps waiting for the 3D (3D on both screens).
 12. **Frameskip only for real peaks**: a frame is skipped only when the emulation is more than 6 ms late
     (DraStic: 3 ms). Spirit Tracks' opening at 1600 MHz: frames shown per second 51.7 -> 54.7, no slowdown.
