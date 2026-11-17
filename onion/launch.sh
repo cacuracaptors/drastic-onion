@@ -78,11 +78,23 @@ if [ -f $cfg ] && [ ! -f config/.dsfast_defaults ]; then
         touch config/.dsfast_defaults
 fi
 
+orig_gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2> /dev/null)
 if [ "$CUST_CPUCLOCK" == "1" ]; then
     # Mini Plus (354) runs at 1800 MHz; Mini v2/v3/v4 (283) and Flip (285): 1600.
     if [ "$(cat /tmp/deviceModel 2> /dev/null)" = "354" ]; then mhz=1800; else mhz=1600; fi
     cpuclock $mhz
 fi
+
+restore_system() {
+    echo $sv >/proc/sys/vm/swappiness
+    [ -n "$ra" ] && echo $ra > $ra_file 2> /dev/null
+    [ -n "$pc" ] && echo $pc > /proc/sys/vm/page-cluster 2> /dev/null
+    if [ "$CUST_CPUCLOCK" == "1" ]; then
+        cpuclock 1200 > /dev/null 2>&1 || /mnt/SDCARD/.tmp_update/bin/cpuclock 1200 > /dev/null 2>&1 || true
+        [ -n "$orig_gov" ] && echo "$orig_gov" > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2> /dev/null || true
+    fi
+}
+trap restore_system EXIT INT TERM
 
 l_triggers_swapped=$(jq ".swap_l1l2" "/mnt/SDCARD/Emu/NDS/resources/settings.json")
 
@@ -104,10 +116,8 @@ fi
 LD_PRELOAD="$(pwd)/libs/libdsfast.so${LD_PRELOAD:+:$LD_PRELOAD}" ./drastic "$1"
 
 sync
-
-echo $sv >/proc/sys/vm/swappiness
-[ -n "$ra" ] && echo $ra > $ra_file 2> /dev/null
-[ -n "$pc" ] && echo $pc > /proc/sys/vm/page-cluster 2> /dev/null
+restore_system
+trap - EXIT INT TERM
 
 # The Mini v4 and Flip go back to 640x480 in runtime.sh (fbmode --preclear),
 # which clears the screen first. An fbset here switched the mode before that
