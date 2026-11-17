@@ -225,10 +225,14 @@ snd_sframes snd_pcm_writei(void *pcm, const void *buffer, unsigned long size)
 /* ------------------------------------------------------------------ 1. frame limiter */
 
 #define FN_SYSTEM_FRAME_SYNC   0x08006850u
-static void (*get_ticks_us)(s64 *t) = (void (*)(s64 *))0x080a7d50u;
+#define FN_GET_TICKS_US        0x080a7d50u
+static void (*get_ticks_us)(s64 *t) = (void (*)(s64 *))FN_GET_TICKS_US;
 static void (*delay_us)(u32 us) = (void (*)(u32))0x080a7dc0u;
 static u32 (*audio_buffer_state)(void *a) = (u32 (*)(void *))0x080aa718u;
 static void (*audio_buffer_force_feed)(void *a) = (void (*)(void *))0x080aa760u;
+
+/* Replace DraStic's get_ticks_us (which overflows 32-bit tv_sec * 1e6 every ~35.8 min) with 64-bit monotonic time */
+static void dsfast_get_ticks_us(s64 *t) { *t = mono_us(); }
 
 #define CFG(s, off)    (*(u32 *)((char *)(s) + 0x85000 + (off)))
 #define SKIP_TYPE      0x768
@@ -249,11 +253,11 @@ static void wait_us(u32 us)
     s64 t0, t;
     if (!us)
         return;
-    get_ticks_us(&t0);
+    t0 = mono_us();
     if (us > 11000)
         delay_us(us - 11000);
     do
-        get_ticks_us(&t);
+        t = mono_us();
     while (t - t0 < (s64)us);
 }
 
@@ -320,6 +324,11 @@ dry: /* the sound buffer ran dry: back to the timer, realigned with now */
 timer:
     delta = (s32)((u32)tgt - (u32)now);
     late = 0;
+    if (delta > 300000) {
+        /* Guard against >100 ms target skew (e.g. clock jump or long pause): resync instead of spinning */
+        *target = now;
+        delta = 0;
+    }
     if (delta > 0)
         wait_us((u32)delta / 3);
     else if (delta < -18000)   /* 6 ms late (DraStic: 3 ms), see section 12 */
@@ -732,6 +741,8 @@ __attribute__((constructor)) static void dsfast_init(void)
         return;
     active = 1;
     set_core(CORE0);   /* the emulation; threads it creates are placed in pthread_create */
+    if (*(u32 *)FN_GET_TICKS_US == 0xe16d40fcu)
+        patch(FN_GET_TICKS_US, (void *)dsfast_get_ticks_us);
     patch(FN_SYSTEM_FRAME_SYNC, (void *)dsfast_system_frame_sync);
     hide_setup();
     split_setup();

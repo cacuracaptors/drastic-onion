@@ -1538,8 +1538,8 @@ static int process_screen(void)
         if (nds.screen.hres_mode[idx]) {
             srt.w = 512;
             srt.h = 384;
+            nds.pen.pos = idx;
             if (nds.hres_mode == 0) {
-                nds.pen.pos = 0;
                 nds.hres_mode = 1;
                 pre_dis_mode = nds.dis_mode;
                 nds.dis_mode = pre_hres_mode;
