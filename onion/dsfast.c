@@ -75,6 +75,7 @@ typedef unsigned long long u64;
 extern long readlink(const char *path, char *buf, unsigned long len);
 extern int mprotect(void *addr, unsigned long len, int prot);
 extern void *dlsym(void *handle, const char *name);
+extern char *getenv(const char *name);
 typedef struct { int __size[6]; } pmutex_t;   /* glibc ARM pthread_mutex_t */
 typedef struct { int __size[12]; } pcond_t;   /* glibc ARM pthread_cond_t */
 extern int pthread_mutex_lock(pmutex_t *m);
@@ -393,6 +394,7 @@ void dsfast_system_frame_sync(void *sys)
 struct fbvar { u32 xres, yres, xres_virtual, yres_virtual, xoffset, yoffset; u32 rest[34]; };
 
 static int (*real_ioctl)(int, unsigned long, void *);
+static void (*gfx_wait_fn)(void);
 static int flip_state;            /* 0 not set up, 1 on, -1 off (plain flips) */
 static pmutex_t fmtx;
 static pcond_t fcond;
@@ -427,6 +429,8 @@ static void *flip_thread(void *p)
             pthread_cond_wait(&fcond, &fmtx);
         fvar.yoffset = (u32)pending;
         pthread_mutex_unlock(&fmtx);
+        if (gfx_wait_fn)
+            gfx_wait_fn(); /* finish async MI_GFX blit on core 0 before scanning out the page */
         real_ioctl(ffd, FBIOPAN_DISPLAY, &fvar); /* returns at the vsync */
         measure_vsync();
         pthread_mutex_lock(&fmtx);
@@ -455,6 +459,15 @@ static void flip_setup(int fd)
     }
     fvar = cur;
     ffd = fd;
+    if (!getenv("DSFAST_NOASYNC")) {
+        /* Offload MI_GFX_WaitAllDone from SDL's core 1 video_handler to core 0 flip_thread */
+        void (*wf)(void) = (void (*)(void))dlsym((void *)0, "mmiyoo_gfx_wait");
+        void (*sa)(int) = (void (*)(int))dlsym((void *)0, "mmiyoo_set_async_gfx");
+        if (wf && sa) {
+            gfx_wait_fn = wf;
+            sa(1);
+        }
+    }
     if (pthread_create(&th, 0, flip_thread, 0))
         return;
     flip_state = 1;
@@ -631,6 +644,7 @@ static void hide3d_start_rendering(void *v3d, u32 arg)
 #define CFG_BATCH_3D 0x7b4
 static u32 split_tramp[4] __attribute__((aligned(16)));
 static u32 split_hist;
+static u32 batch3d_max = 3;
 static void split_finish_rendering(void *v3d)
 {
     s64 t0 = mono_us();
@@ -640,8 +654,10 @@ static void split_finish_rendering(void *v3d)
     split_hist = h;
     for (c = 0, x = h & 0xffff; x; x &= x - 1)
         c++;
-    if (g_sys)
-        CFG(g_sys, CFG_BATCH_3D) = c >= 4 ? 3 : c == 0 ? 1 : CFG(g_sys, CFG_BATCH_3D) == 3 ? 3 : 1;
+    if (g_sys) {
+        u32 n = batch3d_max;
+        CFG(g_sys, CFG_BATCH_3D) = c >= 4 ? n : c == 0 ? 1 : CFG(g_sys, CFG_BATCH_3D) == n ? n : 1;
+    }
 }
 
 static void hide_setup(void)
@@ -674,6 +690,10 @@ static void hide_setup(void)
 
 static void split_setup(void)
 {
+    /* Allow A/B override of 3D worker thread count (1..4); default 3 beats 2 on Cortex-A7 */
+    const char *env_b = getenv("DSFAST_BATCH3D");
+    if (env_b && env_b[0] >= '1' && env_b[0] <= '4' && !env_b[1])
+        batch3d_max = (u32)(env_b[0] - '0');
     split_tramp[0] = *(u32 *)FN_VIDEO_3D_FINISH_RENDERING;        /* strd r4, r5, [sp, #-24]! */
     split_tramp[1] = *(u32 *)(FN_VIDEO_3D_FINISH_RENDERING + 4);  /* movw r4, #0x93b8 */
     split_tramp[2] = 0xe51ff004;

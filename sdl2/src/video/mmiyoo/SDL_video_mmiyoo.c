@@ -74,6 +74,16 @@ int FB_H = 0;
 int FB_SIZE = 0;
 int LINE_H = 0;
 int TMP_SIZE = 0;
+int DUP_SIZE = 0;
+/* Ping-pong cached CMA screen slots in gfx.dup for zero-copy high-res capture */
+static void *sdl_disp_ptr[2] = {NULL, NULL};
+static pthread_mutex_t gfx_wait_mtx = PTHREAD_MUTEX_INITIALIZER;
+static int gfx_pending = 0;
+static int gfx_async_flip = 0;
+static int gfx_want_async = 0;
+#if defined(MMIYOO) && !defined(UNITTEST)
+static MI_U16 gfx_pending_fence = 0;
+#endif
 int FONT_SIZE = 0;
 int show_fps = 0;
 int down_scale = 1;
@@ -1511,10 +1521,12 @@ static int process_screen(void)
         }
 
 #ifdef MMIYOO
-        nds.screen.pixels[0] = (uint32_t *)gfx.dup.virAddr;
-        nds.screen.pixels[1] = nds.screen.hres_mode[idx] ?
-            (uint32_t *)gfx.dup.virAddr :
-            (uint32_t *)((uint8_t *)gfx.dup.virAddr + (256 * 192 * nds.screen.bpp));
+        nds.screen.pixels[0] = sdl_disp_ptr[0] ? (uint32_t *)sdl_disp_ptr[0] : (uint32_t *)gfx.dup.virAddr;
+        nds.screen.pixels[1] = sdl_disp_ptr[1] ?
+            (uint32_t *)sdl_disp_ptr[1] :
+            (nds.screen.hres_mode[idx] ?
+                (uint32_t *)gfx.dup.virAddr :
+                (uint32_t *)((uint8_t *)gfx.dup.virAddr + (256 * 192 * nds.screen.bpp)));
 #else
         nds.screen.pixels[idx] = idx ?
             (uint32_t *)(*((uint32_t *)VAR_SDL_SCREEN1_PIXELS)):
@@ -1725,7 +1737,18 @@ static int process_screen(void)
         }
 
         if (need_update) {
+#ifdef MMIYOO
+            gfx_want_async = (nds.menu.enable == 0) &&
+                (nds.dis_mode != NDS_DIS_MODE_VH_T0) &&
+                (nds.dis_mode != NDS_DIS_MODE_VH_T1) &&
+                (nds.overlay.sel >= nds.overlay.max) &&
+                (show_info_cnt == 0) &&
+                !(show_fps && fps_info);
+#endif
             GFX_Copy(nds.screen.pixels[idx], srt, drt, nds.screen.pitch[idx], 0, rotate);
+#ifdef MMIYOO
+            gfx_want_async = 0;
+#endif
 
 #ifdef MMIYOO
             switch (nds.dis_mode) {
@@ -1783,9 +1806,50 @@ static int process_screen(void)
     return 0;
 }
 
+/* Expose nds.dis_mode so libdsfast can track single-screen layouts cleanly */
 __attribute__((visibility("default"))) int *mmiyoo_get_dis_mode(void)
 {
     return &nds.dis_mode;
+}
+
+/* Drain in-flight async MI_GFX blit before buffer reuse or FBIOPAN_DISPLAY */
+__attribute__((visibility("default"))) void mmiyoo_gfx_wait(void)
+{
+#if defined(MMIYOO) && !defined(UNITTEST)
+    pthread_mutex_lock(&gfx_wait_mtx);
+    if (gfx_pending) {
+        MI_GFX_WaitAllDone(FALSE, gfx_pending_fence);
+        gfx_pending = 0;
+    }
+    pthread_mutex_unlock(&gfx_wait_mtx);
+#endif
+}
+
+/* Enabled by libdsfast when flip_thread handles mmiyoo_gfx_wait() before pan */
+__attribute__((visibility("default"))) void mmiyoo_set_async_gfx(int enable)
+{
+    gfx_async_flip = enable;
+}
+
+/* Guard DraStic's free/realloc against touching our borrowed CMA ping-pong slots */
+static void sdl_free(void *ptr)
+{
+    uint8_t *base = (uint8_t *)gfx.dup.virAddr;
+
+    if (base && ((uint8_t *)ptr == base || (uint8_t *)ptr == base + (512 * 384 * 4))) {
+        return;
+    }
+    free(ptr);
+}
+
+static void *sdl_realloc(void *ptr, size_t size)
+{
+    uint8_t *base = (uint8_t *)gfx.dup.virAddr;
+
+    if (base && ((uint8_t *)ptr == base || (uint8_t *)ptr == base + (512 * 384 * 4))) {
+        return malloc(size);
+    }
+    return realloc(ptr, size);
 }
 
 void sdl_blit_screen_menu(uint16_t *src, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
@@ -1812,20 +1876,37 @@ void sdl_update_screen(void)
         uint32_t frame_bytes = h * pitch;
         void *p0 = (void *)(*(uint32_t *)VAR_SDL_SCREEN0_PIXELS);
         void *p1 = (void *)(*(uint32_t *)VAR_SDL_SCREEN1_PIXELS);
+        uint8_t *s0 = (uint8_t *)gfx.dup.virAddr;
+        uint8_t *s1 = s0 + (512 * 384 * 4);
 
-        if (hres) {
-            void *src = (hres1 && p1) ? p1 : p0;
-            if (src) {
-                neon_memcpy(gfx.dup.virAddr, src, frame_bytes);
+        mmiyoo_gfx_wait();
+        if (hres && s0 && (frame_bytes <= (512u * 384u * 4u))) {
+            /* Point DraStic's active high-res screen at alternating CMA slots to skip 768 KB neon_memcpy */
+            uint32_t *pix_reg = (uint32_t *)((hres1 && p1) ? VAR_SDL_SCREEN1_PIXELS : VAR_SDL_SCREEN0_PIXELS);
+            void *cur_p = (void *)(*pix_reg);
+
+            if ((cur_p == s0) || (cur_p == s1)) {
+                sdl_disp_ptr[0] = cur_p;
+                sdl_disp_ptr[1] = cur_p;
+                *pix_reg = (uint32_t)((cur_p == s0) ? s1 : s0);
+            }
+            else if (cur_p) {
+                neon_memcpy(s0, cur_p, frame_bytes);
+                sdl_disp_ptr[0] = s0;
+                sdl_disp_ptr[1] = s0;
+                *pix_reg = (uint32_t)s1;
+                free(cur_p);
             }
         }
-        else {
+        else if (s0) {
             if (p0) {
-                neon_memcpy(gfx.dup.virAddr, p0, frame_bytes);
+                neon_memcpy(s0, p0, frame_bytes);
             }
             if (p1) {
-                neon_memcpy((uint8_t *)gfx.dup.virAddr + frame_bytes, p1, frame_bytes);
+                neon_memcpy(s0 + frame_bytes, p1, frame_bytes);
             }
+            sdl_disp_ptr[0] = s0;
+            sdl_disp_ptr[1] = s0 + frame_bytes;
         }
 #endif
         __sync_synchronize();
@@ -2840,8 +2921,8 @@ int fb_init(void)
     MI_SYS_Mmap(gfx.fb.phyAddr, gfx.finfo.smem_len, &gfx.fb.virAddr, TRUE);
     memset(&gfx.hw.opt, 0, sizeof(gfx.hw.opt));
 
-    MI_SYS_MMA_Alloc(NULL, TMP_SIZE, &gfx.dup.phyAddr);
-    MI_SYS_Mmap(gfx.dup.phyAddr, TMP_SIZE, &gfx.dup.virAddr, TRUE);
+    MI_SYS_MMA_Alloc(NULL, DUP_SIZE, &gfx.dup.phyAddr);
+    MI_SYS_Mmap(gfx.dup.phyAddr, DUP_SIZE, &gfx.dup.virAddr, TRUE);
 
     MI_SYS_MMA_Alloc(NULL, TMP_SIZE, &gfx.tmp.phyAddr);
     MI_SYS_Mmap(gfx.tmp.phyAddr, TMP_SIZE, &gfx.tmp.virAddr, TRUE);
@@ -2858,10 +2939,12 @@ int fb_init(void)
 int fb_quit(void)
 {
 #ifndef UNITTEST
+    mmiyoo_gfx_wait();
     MI_SYS_Munmap(gfx.fb.virAddr, TMP_SIZE);
 
-    MI_SYS_Munmap(gfx.dup.virAddr, TMP_SIZE);
+    MI_SYS_Munmap(gfx.dup.virAddr, DUP_SIZE);
     MI_SYS_MMA_Free(gfx.dup.phyAddr);
+    gfx.dup.virAddr = NULL;
 
     MI_SYS_Munmap(gfx.tmp.virAddr, TMP_SIZE);
     MI_SYS_MMA_Free(gfx.tmp.phyAddr);
@@ -3039,7 +3122,7 @@ void GFX_Clear(void)
 #if defined(MMIYOO) && !defined(UNITTEST)
     MI_SYS_MemsetPa(gfx.fb.phyAddr, 0, FB_SIZE);
     MI_SYS_MemsetPa(gfx.tmp.phyAddr, 0, TMP_SIZE);
-    MI_SYS_MemsetPa(gfx.dup.phyAddr, 0, TMP_SIZE);
+    MI_SYS_MemsetPa(gfx.dup.phyAddr, 0, DUP_SIZE);
 #endif
 }
 
@@ -4249,7 +4332,7 @@ int GFX_Copy(const void *pixels, SDL_Rect srcrect, SDL_Rect dstrect, int pitch, 
     }
 
     if (copy_it) {
-        if (gfx.dup.virAddr && (pix_addr >= dup_base) && ((pix_addr - dup_base) + copy_bytes <= TMP_SIZE)) {
+        if (gfx.dup.virAddr && (pix_addr >= dup_base) && ((pix_addr - dup_base) + copy_bytes <= (size_t)DUP_SIZE)) {
             size_t dup_off = (size_t)(pix_addr - dup_base);
 
             src_vir = (uint8_t *)gfx.dup.virAddr + dup_off;
@@ -4259,6 +4342,8 @@ int GFX_Copy(const void *pixels, SDL_Rect srcrect, SDL_Rect dstrect, int pitch, 
             neon_memcpy(gfx.tmp.virAddr, pixels, copy_bytes);
         }
     }
+
+    mmiyoo_gfx_wait();
 
     gfx.hw.opt.u32GlobalSrcConstColor = 0;
     gfx.hw.opt.eRotate = rotate;
@@ -4288,9 +4373,9 @@ int GFX_Copy(const void *pixels, SDL_Rect srcrect, SDL_Rect dstrect, int pitch, 
 
     MI_SYS_FlushInvCache(src_vir, copy_bytes);
     MI_GFX_BitBlit(&gfx.hw.src.surf, &gfx.hw.src.rt, &gfx.hw.dst.surf, &gfx.hw.dst.rt, &gfx.hw.opt, &u16Fence);
-    MI_GFX_WaitAllDone(FALSE, u16Fence);
 
     if ((nds.menu.enable == 0) && (srcrect.w != 800) && ((srcrect.w == 256) || (srcrect.w == 512)) && (nds.overlay.sel < nds.overlay.max)) {
+        MI_GFX_WaitAllDone(FALSE, u16Fence);
         gfx.hw.src.rt.s32Xpos = 0;
         gfx.hw.src.rt.s32Ypos = 0;
         gfx.hw.src.rt.u32Width = FB_W;
@@ -4308,6 +4393,15 @@ int GFX_Copy(const void *pixels, SDL_Rect srcrect, SDL_Rect dstrect, int pitch, 
         gfx.hw.opt.eDstDfbBldOp = E_MI_GFX_DFB_BLD_INVSRCALPHA;
         gfx.hw.opt.eDFBBlendFlag = E_MI_GFX_DFB_BLEND_SRC_PREMULTIPLY | E_MI_GFX_DFB_BLEND_COLORALPHA | E_MI_GFX_DFB_BLEND_ALPHACHANNEL;
         MI_GFX_BitBlit(&gfx.hw.overlay.surf, &gfx.hw.overlay.rt, &gfx.hw.dst.surf, &gfx.hw.dst.rt, &gfx.hw.opt, &u16Fence);
+        MI_GFX_WaitAllDone(FALSE, u16Fence);
+    }
+    else if (gfx_async_flip && gfx_want_async) {
+        pthread_mutex_lock(&gfx_wait_mtx);
+        gfx_pending_fence = u16Fence;
+        gfx_pending = 1;
+        pthread_mutex_unlock(&gfx_wait_mtx);
+    }
+    else {
         MI_GFX_WaitAllDone(FALSE, u16Fence);
     }
 #endif
@@ -4329,6 +4423,9 @@ void GFX_Flip(void)
 #endif
 
 #ifdef MMIYOO
+    if (!gfx_async_flip) {
+        mmiyoo_gfx_wait();
+    }
     ioctl(gfx.fb_dev, FBIOPAN_DISPLAY, &gfx.vinfo);
     gfx.vinfo.yoffset ^= FB_H;
 #endif
@@ -5077,12 +5174,16 @@ int MMIYOO_VideoInit(_THIS)
     }
 #endif
 
+    DUP_SIZE = (TMP_SIZE > (2 * 512 * 384 * 4)) ? TMP_SIZE : (2 * 512 * 384 * 4);
+
     GFX_Init();
     read_config();
     MMIYOO_EventInit();
 
     detour_init(sysconf(_SC_PAGESIZE), nds.states.path);
     printf(PREFIX"Installed hooking for drastic functions\n");
+    detour_hook(FUN_FREE, (intptr_t)sdl_free);
+    detour_hook(FUN_REALLOC, (intptr_t)sdl_realloc);
     detour_hook(FUN_PRINT_STRING, (intptr_t)sdl_print_string);
     detour_hook(FUN_SAVESTATE_PRE, (intptr_t)sdl_savestate_pre);
     detour_hook(FUN_SAVESTATE_POST, (intptr_t)sdl_savestate_post);
