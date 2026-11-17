@@ -18,7 +18,7 @@ anything wrong: crashes, freezes, the device turning off, audio problems, slowdo
 
 ## Install
 
-1. Download `DraStic-dsfast-Onion.zip` from the Releases page.
+1. Download the zip of the latest release (`DraStic-dsfast-Onion-<version>.zip`) from the Releases page.
 2. Unzip it to the root of the SD card, replacing files when asked. It contains only:
    - `Emu/NDS/launch.sh` (the Onion launcher with the changes below)
    - `Emu/NDS/libs/libdsfast.so`
@@ -56,6 +56,9 @@ All details, with the measurements behind each one, are in the comments at the t
 11. **3D split over both cores** only while the emulation keeps waiting for the 3D (3D on both screens).
 12. **Frameskip only for real peaks**: a frame is skipped only when the emulation is more than 6 ms late
     (DraStic: 3 ms). Spirit Tracks' opening at 1600 MHz: frames shown per second 51.7 -> 54.7, no slowdown.
+13. **A clock that never jumps back**: DraStic's own clock jumped back ~71 minutes every ~71.6 minutes of play
+    and whenever the system time changed, which froze the game (fixed in Beta 2, reported and fixed by
+    Kmieciu4ever).
 
 The launcher (`launch.sh`) also:
 - sets the CPU clock by model: 1800 MHz on the Mini Plus, 1600 MHz on the Mini v2/v3/v4 and Flip;
@@ -86,6 +89,7 @@ clang --target=armv7a-linux-gnueabihf -mfloat-abi=hard -O2 -fPIC -shared -nostdl
   [README_steward-fu.md](README_steward-fu.md).
 - Onion integration by Sichroteph and schmurtzm ([OnionUI/Onion](https://github.com/OnionUI/Onion)).
 - libdsfast by Régis ([cacuracaptors](https://github.com/cacuracaptors)), with Claude.
+- Long-session freeze fix (Beta 2) by Kmieciu4ever.
 
 ## License
 
