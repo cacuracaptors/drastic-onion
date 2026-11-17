@@ -64,6 +64,16 @@ SET_BAK=/tmp/settings.json.bench_bak
 [ -f "$CFG" ] && cp "$CFG" "$CFG_BAK"
 [ -f "$SET" ] && cp "$SET" "$SET_BAK"
 
+SYS_JSON=/mnt/SDCARD/system.json
+orig_vol=""
+if [ -f "$SYS_JSON" ]; then
+    orig_vol=$(sed -n 's/^[[:space:]]*"vol":[[:space:]]*\([0-9]*\).*/\1/p' "$SYS_JSON" | head -n 1)
+    if [ -n "$orig_vol" ] && [ "$orig_vol" != "0" ]; then
+        sed 's/^\([[:space:]]*"vol":[[:space:]]*\)[0-9][0-9]*/\10/' "$SYS_JSON" > "$SYS_JSON.tmp" &&
+            mv -f "$SYS_JSON.tmp" "$SYS_JSON" && touch /tmp/settings_changed
+    fi
+fi
+
 sv=$(cat /proc/sys/vm/swappiness 2>/dev/null)
 ra_file=/sys/block/mmcblk0/queue/read_ahead_kb
 ra=$(cat "$ra_file" 2>/dev/null)
@@ -87,6 +97,10 @@ if [ -f "$DSV_FILE" ]; then
 fi
 
 cleanup() {
+    if [ -n "$orig_vol" ] && [ "$orig_vol" != "0" ] && [ -f "$SYS_JSON" ]; then
+        sed "s/^\\([[:space:]]*\"vol\":[[:space:]]*\\)[0-9][0-9]*/\\1$orig_vol/" "$SYS_JSON" > "$SYS_JSON.tmp" &&
+            mv -f "$SYS_JSON.tmp" "$SYS_JSON" && touch /tmp/settings_changed
+    fi
     [ -f "$CFG_BAK" ] && cp "$CFG_BAK" "$CFG" && rm -f "$CFG_BAK"
     [ -f "$SET_BAK" ] && cp "$SET_BAK" "$SET" && rm -f "$SET_BAK"
     if [ "$had_auto" = "1" ] && [ -f "$AUTO_BAK" ]; then

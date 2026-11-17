@@ -561,7 +561,7 @@ static void set_core(unsigned long mask) { sys3(241, 0, sizeof(mask), (long)&mas
 #define FN_VIDEO_RENDER_THREAD 0x080287e0u     /* 2D, hands over to the emulation and waits */
 #define FN_VIDEO_3D_RENDER_THREAD 0x080782dcu  /* 3D helper threads (initialize_video_3d always makes 3) */
 static int helpers_seen;
-struct tramp { void *(*fn)(void *); void *arg; unsigned long mask; };
+struct tramp { void *(*fn)(void *); void *arg; unsigned long mask; int nice; };
 extern void *malloc(unsigned int n);
 extern void free(void *p);
 static void *tramp_run(void *p)
@@ -569,6 +569,9 @@ static void *tramp_run(void *p)
     struct tramp t = *(struct tramp *)p;
     free(p);
     set_core(t.mask);
+    /* Main calls setpriority(-5) before spawning threads, which clone() inherits; reset each
+     * child explicitly so Main (-5) > Engine B / flip (0) > w0 3D helper on core 0 (+5). */
+    sys3(97, 0, 0, t.nice);
     return t.fn(t.arg);
 }
 int pthread_create(unsigned long *th, void *attr, void *(*fn)(void *), void *arg)
@@ -576,18 +579,28 @@ int pthread_create(unsigned long *th, void *attr, void *(*fn)(void *), void *arg
     static int (*real)(unsigned long *, void *, void *(*)(void *), void *);
     u32 a = (u32)fn;
     unsigned long mask = CORE1;   /* 3D (video_3d_run_thread, video_3d_render_thread), SDL audio and video... */
+    int nice = 0;
     struct tramp *t;
     if (!real)
         real = (int (*)(unsigned long *, void *, void *(*)(void *), void *))dlsym(RTLD_NEXT, "pthread_create");
-    if (a == FN_VIDEO_RENDER_THREAD || fn == flip_thread)
+    if (a == FN_VIDEO_RENDER_THREAD) {
         mask = CORE0;
-    if (a == FN_VIDEO_3D_RENDER_THREAD && helpers_seen++ == 0)
-        mask = CORE0;             /* 11. the first 3D helper (bins 1, 4, 7...) runs next to the emulation */
+        nice = -5;                /* match Main (-5) so Engine B 2D never stalls behind Main */
+    }
+    if (fn == flip_thread) {
+        mask = CORE0;
+        nice = -8;                /* never miss a vsync pan behind Main/2D */
+    }
+    if (a == FN_VIDEO_3D_RENDER_THREAD && helpers_seen++ == 0) {
+        mask = CORE0;             /* 11. the first 3D helper runs next to the emulation */
+        nice = 5;                 /* idle-fill on core 0: never preempt flip (-8), Main (-5), or Engine B (-5) */
+    }
     if (!active || !(t = (struct tramp *)malloc(sizeof(*t))))
         return real(th, attr, fn, arg);
     t->fn = fn;
     t->arg = arg;
     t->mask = mask;
+    t->nice = nice;
     return real(th, attr, tramp_run, t);
 }
 
@@ -699,8 +712,12 @@ static void hide_setup(void)
 
 static void split_setup(void)
 {
-    /* Allow A/B override of 3D worker thread count (1..4); default 3 beats 2 on Cortex-A7 */
+    /* With 3D bin work-stealing enabled, 2 threads (1 on core 1 + idle-fill w0 on core 0) beat 3
+     * by avoiding core-1 context-switching and L1/L2 thrashing between two 144 KB render targets. */
+    const char *no_steal = getenv("DSFAST_NO_STEAL");
     const char *env_b = getenv("DSFAST_BATCH3D");
+    if (!(no_steal && no_steal[0] == '1'))
+        batch3d_max = 2;
     if (env_b && env_b[0] >= '1' && env_b[0] <= '4' && !env_b[1])
         batch3d_max = (u32)(env_b[0] - '0');
     split_tramp[0] = *(u32 *)FN_VIDEO_3D_FINISH_RENDERING;        /* strd r4, r5, [sp, #-24]! */
@@ -773,6 +790,59 @@ static void neon3d_setup(void)
     }
 }
 
+/* ------------------------------------------------------------------ 15. 3D 4x bin work-stealing
+   Replace static modulo assignment (bin i -> thread i % count) in video_3d_render_bins_4x with an
+   atomic 0..11 bin counter when multi-threaded 3D is active. Because Main Thread runs at nice -5 on
+   core 0, helper w0 sleeps while core 0 finishes CPU/Geom/2D; work-stealing lets core 1 claim bins
+   1..11 without stalling on w0, while w0 picks up remaining bins as soon as main hits finish_rendering. */
+#define FN_VIDEO_3D_RENDER_BINS_4X 0x08077b80u
+#define FN_UPDATE_FRAME_3D_4X_PREP 0x080785acu
+extern volatile u32 dsfast_next_bin;
+extern void dsfast_prep_bins_4x(void);
+static u32 bins4x_tramp[4] __attribute__((aligned(16)));
+
+static void dsfast_render_bins_4x(u8 *rt)
+{
+    void (*orig)(u8 *) = (void (*)(u8 *))(void *)bins4x_tramp;
+    u8 orig_base = rt[0x240aa];
+    u8 orig_inter = rt[0x240ab];
+    if (orig_inter <= 1) {
+        orig(rt);
+        return;
+    }
+    rt[0x240ab] = 12; /* __aeabi_idiv(12, 12) == 1 bin per call */
+    for (;;) {
+        u32 bin = __atomic_fetch_add(&dsfast_next_bin, 1, __ATOMIC_RELAXED);
+        if (bin >= 12)
+            break;
+        rt[0x240aa] = (u8)bin;
+        orig(rt);
+    }
+    rt[0x240aa] = orig_base;
+    rt[0x240ab] = orig_inter;
+}
+
+static void steal3d_setup(void)
+{
+    const char *off = getenv("DSFAST_NO_STEAL");
+    if (off && off[0] == '1')
+        return;
+    if (*(u32 *)FN_UPDATE_FRAME_3D_4X_PREP != 0xe5943004u ||
+        *(u32 *)(FN_UPDATE_FRAME_3D_4X_PREP + 4) != 0xe285296fu)
+        return;
+    if (*(u32 *)FN_VIDEO_3D_RENDER_BINS_4X != 0xe2803909u ||
+        *(u32 *)(FN_VIDEO_3D_RENDER_BINS_4X + 4) != 0xe16d42f4u)
+        return;
+    bins4x_tramp[0] = *(u32 *)FN_VIDEO_3D_RENDER_BINS_4X;       /* add r3, r0, #0x24000 */
+    bins4x_tramp[1] = *(u32 *)(FN_VIDEO_3D_RENDER_BINS_4X + 4); /* strd r4, [sp, #-36]! */
+    bins4x_tramp[2] = 0xe51ff004u;
+    bins4x_tramp[3] = FN_VIDEO_3D_RENDER_BINS_4X + 8;
+    mprotect((void *)((u32)bins4x_tramp & ~4095u), 8192, 7);
+    flush_icache(bins4x_tramp, bins4x_tramp + 4);
+    patch(FN_UPDATE_FRAME_3D_4X_PREP, (void *)dsfast_prep_bins_4x);
+    patch(FN_VIDEO_3D_RENDER_BINS_4X, (void *)dsfast_render_bins_4x);
+}
+
 __attribute__((constructor)) static void dsfast_init(void)
 {
     char exe[256];
@@ -797,4 +867,5 @@ __attribute__((constructor)) static void dsfast_init(void)
     split_setup();
     copy3d_setup();
     neon3d_setup();
+    steal3d_setup();
 }

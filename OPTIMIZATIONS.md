@@ -50,13 +50,23 @@
 ## Tier 2 & Tier 3c — Remaining Verified Bottlenecks
 
 7. **Modern Toolchain (`GCC 13.3 -mcpu=cortex-a7 -mfpu=neon-vfpv4` + LTO + PGO):** Original `drastic` r2.5.0.4 was built with GCC 4.8.x generic ARM32.
-8. **Dynamic 3D Bin Work-Stealing (`video_3d_render_bins_4x`):** `gta1_samp.bin` showed Main Thread blocked `16.75%` (`67/400`) in `pthread_cond_wait`; with Main Thread at `nice -5` on `CORE0`, `w0` (`bins 1,4,7,10`) is starved until 2D finishes while `CORE1` (`w1 + 3d_run`) finishes early and sleeps. Replacing `bin % count` with atomic work-stealing eliminates idle stalls at `video_3d_finish_rendering()`.
+   - *Reference check (`steward-fu/nds`, 2026-11-17):* Checked [steward-fu/nds](https://github.com/steward-fu/nds) — it does **not** contain a compilable decompilation of DraStic. The shipped emulator still runs proprietary binaries (`drastic16` / `drastic32` / `drastic64`, e.g., Pandora ELF) with `LD_LIBRARY_PATH` library overrides (`sdl2`, `alsa`) and runtime binary hooking (`detour/libdtr.so`). Its `re-drastic/{16,32,64}/` folders hold only raw Ghidra C/disasm dumps (`decom/`, `disasm/`) with no build system or module split, unlike `G:\Emulacja\drastic-decompile` (which maps `r2.5.0.4` via `addr2line` into `modules/core/*` and `modules/asm/*`).
+### 8. ~~Dynamic 3D Bin Work-Stealing (`video_3d_render_bins_4x`) + Child `nice` Hierarchy~~ — **DONE (Tier 3c #1)**
+- **Where:** `onion/dsfast_neon.S` (`dsfast_next_bin`, `dsfast_prep_bins_4x` at `0x080785ac`), `onion/dsfast.c` (`dsfast_render_bins_4x` at `0x08077b80`, `tramp_run` nice hierarchy, `batch3d_max = 2` default when stealing).
+- **Root cause found:** In Tier 3b, `dsfast_init` set Main Thread `setpriority(-5)` before `pthread_create`, and Linux `clone()` inherited `-5` into `flip_thread`, `Engine B`, and `w0`. With work-stealing active, `w0` (`nice -5`) preempted `Engine B` (`2D 0.93 -> 2.06 ms` in MKDS) and stole 6/12 bins in `GTA_OLD` (`p50 23.4 -> 27.1 ms`).
+- **Fix & measured A/B vs Tier 3b (`1800 MHz`, `hires_3d=1`, `32 bpp`, `SHOT MD5 MATCH=True` on all 4 games):**
+  - Explicit priorities `flip (-8) > Main (-5) == Engine B (-5) > w0 (+5)` + atomic 0..11 bin claiming + `batch3d_max = 2` (eliminates Core 1 L1/L2 thrashing between two 144 KB render targets):
+    - *MKDS (`slot 0`)*: `emu 21.39 -> 20.77 ms` (`p90 27.89 -> 26.09`, `p99 31.95 -> 30.91`), `flip >50ms 2 -> 0`.
+    - *GTA bridge (`slot 1`)*: `emu 21.17 -> 20.65 ms` (`p50 32.98 -> 31.32`, `max 50.83 -> 49.46`), `flip p99 54.49 -> 34.14 ms`, `>50ms 16 -> 5`.
+    - *GTA old (`slot 0`)*: `emu 16.84 -> 16.44 ms` (`p50 23.12 -> 22.47`, `p99 39.71 -> 32.87`).
+    - *GTA car (`slot 2`)*: `p50 20.80 -> 19.73 ms`, `p99 33.66 -> 32.96 ms`.
 9. **Remaining 2D Scanlines on Main Thread (~`3.05 ms` in GTA):** `render_scanline_color_convert_direct_32_2x` (`0x080bf1c4`, `2.25%` steady GTA, zero `pld`s, `6/10` stalled on `vst4.8`), `render_scanline_palette_lookup_8bpp` (`0x080bcab0`, `1.50%`), `render_scanline_2d` (`0x0804b700` C `0x12f0`).
 10. **Native 752x560 (Mini v4 / Flip) Triple-Buffering & Direct 48 kHz `audioserver` FIFO:** Remove `PAGE_H = 480` restriction in `dsfast.c` and replace `stop_audioserver.sh` + `MI_AO` hack (also causes speaker startup/exit DC-bias pop in `libasound.so.2`) with clean 48 kHz resampling to `/tmp/audio_fifo_server`.
 11. **Shared 3D/Geometry Hotspots (`gta1_samp` + `mkds_samp`):** `render_polygon_setup_perspective_steps` (`8.2%` GTA / `10.3%` MKDS), `setup_perspective_coefficients` (`6.4%` / `5.6%`), `interpolate_w` (`4.6%` / `4.2%`), `modulate` (`4.4%` / `5.3%`), `process_geometry_commands` (`0x0807ecd0`, `3.5%` Main Thread).
+    - *`steward-fu/nds` lead (2026-11-17):* `detour/hook.S` in `steward-fu/nds` implements a NEON version of `render_polygon_setup_perspective_steps` using `vrecpe.f32` + two Newton-Raphson `vrecps.f32` steps (and `detour/hook.h` documents internal DraStic struct layouts such as `system_t`, `audio_struct`, `spu_channel_struct`, `backup_struct`). Before adopting for `r2.5.0.4`, verify ABI/register usage against `drastic-decompile` and test bit-exactness / visual parity (reciprocal estimate vs exact division).
 
 ---
 
 ## Next Measurement Queue
-1. Capture post-Tier-3b `ptrace` sample on `GTA bridge (slot 1)` to measure `Core 0`/`Core 1` wait & test **3D atomic bin work-stealing** in `video_3d_render_bins_4x`.
-2. Benchmark **Tier 3c** NEON+PLD `render_scanline_color_convert_direct_32_2x` + `render_scanline_palette_lookup_8bpp` (2D Main Thread critical path in GTA).
+1. Deploy Tier 3c #1 (`libdsfast.so`) after owner OK, then implement & benchmark **Tier 3c #2**: NEON+PLD `render_scanline_color_convert_direct_32_2x` (`0x080bf1c4`) + `render_scanline_palette_lookup_8bpp` (`0x080bcab0`) (2D Main Thread critical path in GTA).
+2. Re-profile or benchmark **Tier 3c #3** shared 3D/Geometry hotspots (`setup_perspective_steps`, `setup_perspective_coefficients`, `interpolate_w`, `modulate`, `process_geometry_commands`).

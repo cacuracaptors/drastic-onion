@@ -772,3 +772,35 @@ dsfast_engine_b_tramp:
     movw    r8, #44184              /* 0xac98 */
     ldr     pc, =0x08035fb4
     .size dsfast_engine_b_tramp, .-dsfast_engine_b_tramp
+
+/* Dynamic 3D 4x bin counter + pre-dispatch reset trampoline at 0x080785ac in update_frame_3d_4x:
+ * Entered right after video_3d_bin_polygons_4x, before waking render_targets[1..] or calling
+ * video_3d_render_bins_4x on render_targets[0]. Resets dsfast_next_bin = 0 and replays the two
+ * overwritten instructions (ldr r3, [r4, #4]; add r2, r5, #0x1bc000). */
+    .data
+    .align 4
+    .global dsfast_next_bin
+    .hidden dsfast_next_bin
+dsfast_next_bin:
+    .word   0
+
+    .text
+    .align 4
+    .global dsfast_prep_bins_4x
+    .hidden dsfast_prep_bins_4x
+    .type dsfast_prep_bins_4x, %function
+dsfast_prep_bins_4x:
+    ldr     r3, .Lnext_bin_off
+.Lpic_next_bin:
+    add     r3, pc, r3
+    mov     r2, #0
+    str     r2, [r3]
+    dmb     ish
+    ldr     r3, [r4, #4]
+    add     r2, r5, #0x1bc000
+    ldr     pc, .Lprep_ret
+.Lnext_bin_off:
+    .word   dsfast_next_bin - (.Lpic_next_bin + 8)
+.Lprep_ret:
+    .word   0x080785b4
+    .size dsfast_prep_bins_4x, .-dsfast_prep_bins_4x
