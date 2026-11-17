@@ -65,6 +65,11 @@
  *     repeated frames (slowdown) appear at 1600 MHz, so 6 ms is the limit.
  *
  *
+ * 13. A clock that never jumps back (see section 1): DraStic's own clock jumped back 4295 s every ~71.6 minutes
+ *     of play and whenever the system time changed, and the limiter then waited for the whole jump (the game
+ *     froze). Reproduced by moving the system clock back 20 s four times during Mario Kart DS: frozen 20 s every
+ *     time before, 61-62 frames/s throughout after.
+ *
  * All act only inside the drastic executable (programs it starts inherit LD_PRELOAD). */
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -230,8 +235,10 @@ static void (*delay_us)(u32 us) = (void (*)(u32))0x080a7dc0u;
 static u32 (*audio_buffer_state)(void *a) = (u32 (*)(void *))0x080aa718u;
 static void (*audio_buffer_force_feed)(void *a) = (void (*)(void *))0x080aa760u;
 
-/* DraStic's get_ticks_us() computes (s32)tv_sec * 1000000 and sign-extends bit 31, jumping -4295 s
-   every ~35.8 minutes (or on NTP/RTC jumps). Replace it with 64-bit CLOCK_MONOTONIC via mono_us(). */
+/* DraStic's get_ticks_us() reads the wall clock (gettimeofday), computes (s32)tv_sec * 1000000 and
+   sign-extends bit 31, jumping -4295 s every ~71.6 minutes (2^32 us), and it also jumps whenever the
+   system time is changed. A jump back during the limiter's wait froze the game for the size of the jump.
+   Replace it with 64-bit CLOCK_MONOTONIC via mono_us(). Reported and fixed by Kmieciu4ever (PR #1). */
 static void dsfast_get_ticks_us(s64 *t) { *t = mono_us(); }
 
 #define CFG(s, off)    (*(u32 *)((char *)(s) + 0x85000 + (off)))
