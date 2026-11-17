@@ -1,5 +1,6 @@
 drastic_*.zip
 nds_*.opk
+onion/bench/build/
 
 sdl2/configure
 sdl2/config.log

@@ -574,13 +574,22 @@ int pthread_create(unsigned long *th, void *attr, void *(*fn)(void *), void *arg
 #define FN_RENDER_SCANLINE 0x0804c9f0u
 #define DS_SCREENS 0x0aee952cu   /* DraStic's 2 screens, 28 bytes each: +4 pixels, +0x19 high-res mode */
 static int *sdl_nds;             /* libSDL2 v1.8 'nds' struct, dis_mode at +0x10 */
+static int *sdl_dis_mode;        /* direct &nds.dis_mode when mmiyoo_get_dis_mode() is exported */
 static u32 hide_tramp[4] __attribute__((aligned(16)));   /* render_scanline's first 2 instructions + jump back */
 static u8 *volatile hide_a, *volatile hide_a_cap;   /* engine A (the one with 3D) and its capture settings */
 static int hidden_screen(void)
 {
-    if (*(u8 *)(DS_SCREENS + 0x19))
+    u8 h0 = *(u8 *)(DS_SCREENS + 0x19);
+    u8 h1 = *(u8 *)(DS_SCREENS + 28 + 0x19);
+    int dm;
+    if (h0 && !h1)
         return 1;
-    if (sdl_nds[4] == 2 || sdl_nds[4] == 3)           /* NDS_DIS_MODE_S0 / S1 */
+    if (h1 && !h0)
+        return 0;
+    if (h1)
+        return 0;
+    dm = sdl_dis_mode ? *sdl_dis_mode : (sdl_nds ? sdl_nds[4] : -1);
+    if (dm == 2 || dm == 3)           /* NDS_DIS_MODE_S0 / S1 */
         return 0;
     return -1;
 }
@@ -637,11 +646,16 @@ static void split_finish_rendering(void *v3d)
 
 static void hide_setup(void)
 {
-    u8 *init = (u8 *)dlsym((void *)0, "SDL_Init");
-    /* only with the libSDL2 v1.8 build: SDL_Init at 0x35470, process_screen (push r4-r11, lr) at 0xe6178 */
-    if (!init || *(u32 *)(init - 0x35470 + 0xe6178) != 0xe92d4ff0u)
-        return;
-    sdl_nds = (int *)(init - 0x35470 + 0x16e4a0);
+    int *(*get_dm)(void) = (int *(*)(void))dlsym((void *)0, "mmiyoo_get_dis_mode");
+    if (get_dm) {
+        sdl_dis_mode = get_dm();
+    } else {
+        u8 *init = (u8 *)dlsym((void *)0, "SDL_Init");
+        /* only with the libSDL2 v1.8 build: SDL_Init at 0x35470, process_screen (push r4-r11, lr) at 0xe6178 */
+        if (!init || *(u32 *)(init - 0x35470 + 0xe6178) != 0xe92d4ff0u)
+            return;
+        sdl_nds = (int *)(init - 0x35470 + 0x16e4a0);
+    }
     hide_tramp[0] = *(u32 *)FN_RENDER_SCANLINE;         /* strd r4, r5, [sp, #-36]! */
     hide_tramp[1] = *(u32 *)(FN_RENDER_SCANLINE + 4);   /* movw r5, #0x2008 */
     hide_tramp[2] = 0xe51ff004;                          /* ldr pc, [pc, #-4] */
@@ -669,6 +683,19 @@ static void split_setup(void)
     patch(FN_VIDEO_3D_FINISH_RENDERING, (void *)split_finish_rendering);
 }
 
+/* ------------------------------------------------------------------ 13. 3D 4x skipped-frame copy bypass */
+#define FN_3D_4X_SKIP_COPY 0x08078458u
+static void copy3d_setup(void)
+{
+    u32 *p = (u32 *)FN_3D_4X_SKIP_COPY;
+    if (p[0] == 0xe3a02703u && p[1] == 0xe28dd01cu) {
+        mprotect((void *)(FN_3D_4X_SKIP_COPY & ~4095u), 8192, 7);
+        p[0] = 0xe5881054u; /* str r1, [r8, #84] (color_buffer_render = color_buffer_last_rendered) */
+        p[1] = 0xea000018u; /* b 0x080784c4 */
+        flush_icache(p, p + 2);
+    }
+}
+
 __attribute__((constructor)) static void dsfast_init(void)
 {
     char exe[256];
@@ -688,4 +715,5 @@ __attribute__((constructor)) static void dsfast_init(void)
     patch(FN_SYSTEM_FRAME_SYNC, (void *)dsfast_system_frame_sync);
     hide_setup();
     split_setup();
+    copy3d_setup();
 }

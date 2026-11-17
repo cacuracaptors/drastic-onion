@@ -422,51 +422,6 @@ static void* draw_thread(void *pParam)
 }
 #endif
 
-#ifdef MMIYOO
-static void* sdl_malloc(size_t size)
-{
-    static int idx = 0;
-
-    void *r = NULL;
-    uint32_t bpp = *((uint32_t *)VAR_SDL_SCREEN_BPP);
-
-    if ((size == (256 * 192 * bpp)) ||
-        (size == (512 * 384 * bpp)))
-    {
-        r = nds.screen.dma.virAddr[idx];
-        idx += 1;
-        idx %= 2;
-    }
-    else {
-        r = malloc(size);
-    }
-    return r;
-}
-
-static void sdl_free(void *ptr)
-{
-    if ((ptr != nds.screen.dma.virAddr[0]) && (ptr != nds.screen.dma.virAddr[1])) {
-        free(ptr);
-    }
-}
-
-static void* sdl_realloc(void *ptr, size_t size)
-{
-    void *r = NULL;
-    uint32_t bpp = *((uint32_t *)VAR_SDL_SCREEN_BPP);
-
-    if ((size == (256 * 192 * bpp)) ||
-        (size == (512 * 384 * bpp)))
-    {
-        r = sdl_malloc(size);
-    }
-    else {
-        r = realloc(ptr, size);
-    }
-    return r;
-}
-#endif
-
 static void write_file(const char *fname, const void *buf, int len)
 {
     struct stat st = {0};
@@ -1410,7 +1365,7 @@ static int process_screen(void)
     static int cur_theme_sel = 0;
     static int cur_down_scale = 0;
     static int pre_dis_mode = NDS_DIS_MODE_VH_S0;
-    static int pre_hres_mode = NDS_DIS_MODE_HRES0;
+    static int pre_hres_mode = NDS_DIS_MODE_HRES1;
     static char show_info_buf[MAX_PATH << 1] = {0};
 
     int idx = 0;
@@ -1551,7 +1506,16 @@ static int process_screen(void)
             *((uint8_t *)VAR_SDL_SCREEN1_HRES_MODE):
             *((uint8_t *)VAR_SDL_SCREEN0_HRES_MODE);
 
-#ifndef MMIYOO
+        if ((idx == 0) && *((uint8_t *)VAR_SDL_SCREEN1_HRES_MODE)) {
+            continue;
+        }
+
+#ifdef MMIYOO
+        nds.screen.pixels[0] = (uint32_t *)gfx.dup.virAddr;
+        nds.screen.pixels[1] = nds.screen.hres_mode[idx] ?
+            (uint32_t *)gfx.dup.virAddr :
+            (uint32_t *)((uint8_t *)gfx.dup.virAddr + (256 * 192 * nds.screen.bpp));
+#else
         nds.screen.pixels[idx] = idx ?
             (uint32_t *)(*((uint32_t *)VAR_SDL_SCREEN1_PIXELS)):
             (uint32_t *)(*((uint32_t *)VAR_SDL_SCREEN0_PIXELS));
@@ -1761,9 +1725,6 @@ static int process_screen(void)
         }
 
         if (need_update) {
-#ifdef MMIYOO
-            MI_SYS_FlushInvCache(nds.screen.pixels[idx], nds.screen.pitch[idx] * srt.h);
-#endif
             GFX_Copy(nds.screen.pixels[idx], srt, drt, nds.screen.pitch[idx], 0, rotate);
 
 #ifdef MMIYOO
@@ -1822,6 +1783,11 @@ static int process_screen(void)
     return 0;
 }
 
+__attribute__((visibility("default"))) int *mmiyoo_get_dis_mode(void)
+{
+    return &nds.dis_mode;
+}
+
 void sdl_blit_screen_menu(uint16_t *src, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
 }
@@ -1836,44 +1802,33 @@ void sdl_update_screen(void)
     }
     else if (nds.update_screen == 0) {
 #ifdef MMIYOO
-        int cc = 0;
-        int cnt = 2;
-        uint8_t hres = *((uint8_t *)VAR_SDL_SCREEN0_HRES_MODE);
+        uint8_t hres0 = *((uint8_t *)VAR_SDL_SCREEN0_HRES_MODE);
+        uint8_t hres1 = *((uint8_t *)VAR_SDL_SCREEN1_HRES_MODE);
+        uint8_t hres = hres0 | hres1;
         uint32_t bpp = *((uint32_t *)VAR_SDL_SCREEN_BPP);
         uint32_t w = hres ? 512 : 256;
         uint32_t h = hres ? 384 : 192;
-        uint32_t pitch = (hres * bpp * 0x100) + (bpp * 0x100);
-        uint32_t color = ((pitch / w) == 2 ? E_MI_GFX_FMT_RGB565 : E_MI_GFX_FMT_ARGB8888);
+        uint32_t pitch = w * bpp;
+        uint32_t frame_bytes = h * pitch;
+        void *p0 = (void *)(*(uint32_t *)VAR_SDL_SCREEN0_PIXELS);
+        void *p1 = (void *)(*(uint32_t *)VAR_SDL_SCREEN1_PIXELS);
 
-        MI_U16 u16Fence = 0;
-        MI_GFX_Opt_t opt = {0};
-        MI_GFX_Rect_t srt = {0};
-        MI_GFX_Rect_t drt = {0};
-        MI_GFX_Surface_t ssurf = {0};
-        MI_GFX_Surface_t dsurf = {0};
-
-        opt.eSrcDfbBldOp = E_MI_GFX_DFB_BLD_ONE;
-
-        ssurf.u32Width = srt.u32Width = w;
-        ssurf.u32Height = srt.u32Height = h;
-        ssurf.u32Stride = pitch;
-        ssurf.eColorFmt = color;
-
-        dsurf.u32Width = drt.u32Width = w;
-        dsurf.u32Height = drt.u32Height = h;
-        dsurf.u32Stride = pitch;
-        dsurf.eColorFmt = color;
-
-        cnt = hres ? 1 : 2;
-        for (cc = 0; cc < cnt; cc++) {
-            ssurf.phyAddr = nds.screen.dma.phyAddr[cc];
-            dsurf.phyAddr = gfx.dup.phyAddr + (cc * h * pitch);
-
-            MI_SYS_FlushInvCache(nds.screen.dma.virAddr[cc], pitch * h);
-            MI_GFX_BitBlit(&ssurf, &srt, &dsurf, &drt, &opt, &u16Fence);
-            MI_GFX_WaitAllDone(FALSE, u16Fence);
+        if (hres) {
+            void *src = (hres1 && p1) ? p1 : p0;
+            if (src) {
+                neon_memcpy(gfx.dup.virAddr, src, frame_bytes);
+            }
+        }
+        else {
+            if (p0) {
+                neon_memcpy(gfx.dup.virAddr, p0, frame_bytes);
+            }
+            if (p1) {
+                neon_memcpy((uint8_t *)gfx.dup.virAddr + frame_bytes, p1, frame_bytes);
+            }
         }
 #endif
+        __sync_synchronize();
         nds.update_screen = 1;
     }
 }
@@ -2870,8 +2825,6 @@ void disp_resize(void)
 int fb_init(void)
 {
 #ifndef UNITTEST
-    int cc = 0;
-
     MI_SYS_Init();
     MI_GFX_Open();
 
@@ -2896,11 +2849,6 @@ int fb_init(void)
     MI_SYS_MMA_Alloc(NULL, TMP_SIZE, &gfx.overlay.phyAddr);
     MI_SYS_Mmap(gfx.overlay.phyAddr, TMP_SIZE, &gfx.overlay.virAddr, TRUE);
 
-    for (cc = 0; cc < 2; cc++) {
-        MI_SYS_MMA_Alloc(NULL, SCREEN_DMA_SIZE, &nds.screen.dma.phyAddr[cc]);
-        MI_SYS_Mmap(nds.screen.dma.phyAddr[cc], SCREEN_DMA_SIZE, &nds.screen.dma.virAddr[cc], TRUE);
-    }
-
     nds.screen.pixels[0] = gfx.dup.virAddr;
     nds.screen.pixels[1] = nds.screen.pixels[0] + (256 * 192);
 #endif
@@ -2910,8 +2858,6 @@ int fb_init(void)
 int fb_quit(void)
 {
 #ifndef UNITTEST
-    int cc = 0;
-
     MI_SYS_Munmap(gfx.fb.virAddr, TMP_SIZE);
 
     MI_SYS_Munmap(gfx.dup.virAddr, TMP_SIZE);
@@ -2922,11 +2868,6 @@ int fb_quit(void)
 
     MI_SYS_Munmap(gfx.overlay.virAddr, TMP_SIZE);
     MI_SYS_MMA_Free(gfx.overlay.phyAddr);
-
-    for (cc = 0; cc < 2; cc++) {
-        MI_SYS_Munmap(nds.screen.dma.virAddr[cc], SCREEN_DMA_SIZE);
-        MI_SYS_MMA_Free(nds.screen.dma.phyAddr[cc]);
-    }
 
     MI_GFX_Close();
     MI_SYS_Exit();
@@ -3798,6 +3739,11 @@ int GFX_Copy(const void *pixels, SDL_Rect srcrect, SDL_Rect dstrect, int pitch, 
     int copy_it = 1;
     MI_U16 u16Fence = 0;
     int is_rgb565 = (pitch / srcrect.w) == 2 ? 1 : 0;
+    void *src_vir = gfx.tmp.virAddr;
+    MI_PHY src_phy = gfx.tmp.phyAddr;
+    uintptr_t dup_base = (uintptr_t)gfx.dup.virAddr;
+    uintptr_t pix_addr = (uintptr_t)pixels;
+    size_t copy_bytes = (size_t)srcrect.h * (size_t)pitch;
 
     if (pixels == NULL) {
         return -1;
@@ -4303,7 +4249,15 @@ int GFX_Copy(const void *pixels, SDL_Rect srcrect, SDL_Rect dstrect, int pitch, 
     }
 
     if (copy_it) {
-        neon_memcpy(gfx.tmp.virAddr, pixels, srcrect.h * pitch);
+        if (gfx.dup.virAddr && (pix_addr >= dup_base) && ((pix_addr - dup_base) + copy_bytes <= TMP_SIZE)) {
+            size_t dup_off = (size_t)(pix_addr - dup_base);
+
+            src_vir = (uint8_t *)gfx.dup.virAddr + dup_off;
+            src_phy = gfx.dup.phyAddr + dup_off;
+        }
+        else {
+            neon_memcpy(gfx.tmp.virAddr, pixels, copy_bytes);
+        }
     }
 
     gfx.hw.opt.u32GlobalSrcConstColor = 0;
@@ -4320,7 +4274,7 @@ int GFX_Copy(const void *pixels, SDL_Rect srcrect, SDL_Rect dstrect, int pitch, 
     gfx.hw.src.surf.u32Height = srcrect.h;
     gfx.hw.src.surf.u32Stride = pitch;
     gfx.hw.src.surf.eColorFmt = is_rgb565 ? E_MI_GFX_FMT_RGB565 : E_MI_GFX_FMT_ARGB8888;
-    gfx.hw.src.surf.phyAddr = gfx.tmp.phyAddr;
+    gfx.hw.src.surf.phyAddr = src_phy;
 
     gfx.hw.dst.rt.s32Xpos = dstrect.x;
     gfx.hw.dst.rt.s32Ypos = dstrect.y;
@@ -4332,7 +4286,7 @@ int GFX_Copy(const void *pixels, SDL_Rect srcrect, SDL_Rect dstrect, int pitch, 
     gfx.hw.dst.surf.eColorFmt = E_MI_GFX_FMT_ARGB8888;
     gfx.hw.dst.surf.phyAddr = gfx.fb.phyAddr + (FB_W * gfx.vinfo.yoffset * FB_BPP);
 
-    MI_SYS_FlushInvCache(gfx.tmp.virAddr, pitch * srcrect.h);
+    MI_SYS_FlushInvCache(src_vir, copy_bytes);
     MI_GFX_BitBlit(&gfx.hw.src.surf, &gfx.hw.src.rt, &gfx.hw.dst.surf, &gfx.hw.dst.rt, &gfx.hw.opt, &u16Fence);
     MI_GFX_WaitAllDone(FALSE, u16Fence);
 
@@ -5134,12 +5088,6 @@ int MMIYOO_VideoInit(_THIS)
     detour_hook(FUN_SAVESTATE_POST, (intptr_t)sdl_savestate_post);
     detour_hook(FUN_BLIT_SCREEN_MENU, (intptr_t)sdl_blit_screen_menu);
     detour_hook(FUN_UPDATE_SCREEN, (intptr_t)sdl_update_screen);
-#ifdef MMIYOO
-    printf(PREFIX"Installed hooking for libc functions\n");
-    detour_hook(FUN_MALLOC, (intptr_t)sdl_malloc);
-    detour_hook(FUN_REALLOC, (intptr_t)sdl_realloc);
-    detour_hook(FUN_FREE, (intptr_t)sdl_free);
-#endif
     return 0;
 }
 
