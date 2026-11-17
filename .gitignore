@@ -1,7 +1,17 @@
 drastic_*.zip
 nds_*.opk
 onion/bench/build/
+scratch/
 
+alsa/libasound.so.2
+detour/libdtr.so
+sdl2/build/
+sdl2/Makefile
+sdl2/Makefile.rules
+sdl2/aclocal.m4*
+sdl2/config.status
+sdl2/libtool
+sdl2/sdl2-config
 sdl2/configure
 sdl2/config.log
 sdl2/include/SDL_config.h
