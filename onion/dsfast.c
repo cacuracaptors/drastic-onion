@@ -725,6 +725,54 @@ static void copy3d_setup(void)
     }
 }
 
+/* ------------------------------------------------------------------ 14. NEON + PLD 3D 4x & 2D kernels */
+extern void dsfast_resolve_bin_4x(void);
+extern void dsfast_writeback_4x(void);
+extern void dsfast_load_depth_4x(void);
+extern void dsfast_load_depth_colors_id_4x(void);
+extern void dsfast_writeback_all_pass_4x(void);
+extern void dsfast_render_scanline_set_3d_visibility(void);
+extern void dsfast_select_pixels_binary32(void);
+extern void dsfast_edge_mark_4x(void);
+extern void dsfast_edge_identify_4x(void);
+extern void dsfast_engine_b_tramp(void);
+
+int dsfast_should_skip_eb(const u8 *video)
+{
+    int hidden = hidden_screen();
+    if (hidden < 0)
+        return 0;
+    return *(void *const *)(video + 0x82d30 + 0x1c) == *(void *const *)(DS_SCREENS + 28 * hidden + 4);
+}
+
+static void neon3d_setup(void)
+{
+    static const struct { u32 addr; u32 insn; void (*fn)(void); } k[] = {
+        { 0x080c50fcu, 0xe3a03020u, dsfast_resolve_bin_4x },
+        { 0x080c4a90u, 0xe92d4ff0u, dsfast_writeback_4x },
+        { 0x080c49d0u, 0xe282cd16u, dsfast_load_depth_4x },
+        { 0x080c4a18u, 0xe92d47f0u, dsfast_load_depth_colors_id_4x },
+        { 0x080c4b08u, 0xe92d4070u, dsfast_writeback_all_pass_4x },
+        { 0x08048c50u, 0xe16d41f0u, dsfast_render_scanline_set_3d_visibility },
+        { 0x080bef80u, 0xe92d4010u, dsfast_select_pixels_binary32 },
+        { 0x080c55a0u, 0xe92d4000u, dsfast_edge_mark_4x },
+        { 0x080c5658u, 0xe92d4030u, dsfast_edge_identify_4x },
+    };
+    const char *off = getenv("DSFAST_NO_NEON3D");
+    const char *noeb = getenv("DSFAST_NO_SKIPEB");
+    unsigned i;
+    if (!(noeb && noeb[0] == '1') &&
+        *(u32 *)0x08035facu == 0xe59d9008u && *(u32 *)0x08035fb0u == 0xe30a8c98u) {
+        patch(0x08035facu, (void *)dsfast_engine_b_tramp);
+    }
+    if (off && off[0] == '1')
+        return;
+    for (i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
+        if (*(u32 *)k[i].addr == k[i].insn)
+            patch(k[i].addr, (void *)k[i].fn);
+    }
+}
+
 __attribute__((constructor)) static void dsfast_init(void)
 {
     char exe[256];
@@ -741,10 +789,12 @@ __attribute__((constructor)) static void dsfast_init(void)
         return;
     active = 1;
     set_core(CORE0);   /* the emulation; threads it creates are placed in pthread_create */
+    sys3(97, 0, 0, -5); /* setpriority: keep Core 0 priority above w0 3D helper (nice 0) */
     if (*(u32 *)FN_GET_TICKS_US == 0xe16d40fcu)
         patch(FN_GET_TICKS_US, (void *)dsfast_get_ticks_us);
     patch(FN_SYSTEM_FRAME_SYNC, (void *)dsfast_system_frame_sync);
     hide_setup();
     split_setup();
     copy3d_setup();
+    neon3d_setup();
 }

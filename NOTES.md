@@ -4,6 +4,13 @@
 
 ## Handoff
 
+- **Active branch (`2026-11-17`):** `onion-dsfast` (`c4b1fc2f` committed; local uncommitted Tier 3b in `onion/dsfast.c` & `onion/dsfast_neon.S`, built to `scratch/libdsfast_t3.so` — NOT yet deployed to `/mnt/SDCARD/Emu/NDS/libs/libdsfast.so`). `mlock` is free.
+- **Tier 3b verified (`qemu-arm -B 0x100000000` all 9 kernels bit-exact + Miyoo 1800 MHz A/B vs Tier 2 `libdsfast.so`, `hires_3d=1`, `640x480` `32 bpp`):**
+  - `MKDS` (`slot 0`, `SHOT MD5 MATCH=True`): `dsemu mean 22.22/23.06 -> 21.05/21.27 ms` (`-1.48 ms`, `+3.1 fps`), `p50 21.21/22.01 -> 19.99/20.20 ms`, `p99 32.87/35.05 -> 31.33/31.02 ms`, `flip mean 22.16/22.98 -> 20.94/21.20 ms`; `--benchmark 300`: `Full 19.25 -> 18.13 ms`, `3D 10.38 -> 9.52 ms`, `2D 1.02 -> 0.86 ms`.
+  - `GTA_BRIDGE` (`slot 1`, `SHOT MD5 MATCH=True`): `--benchmark 300`: `Full 16.14 -> 15.61 ms`, `2D 3.53 -> 3.05 ms` (`-13.6%`), `3D 7.09 -> 6.75 ms`; `play`: `dsemu mean 21.59/21.55 -> 21.15/21.33 ms` (`p50 33.01/32.85 -> 32.33/32.27 ms`), `flip mean 22.80/22.81 -> 22.48/22.51 ms`.
+  - `GTA_OLD` (`slot 0`): `--benchmark 300`: `2D 3.04 -> 2.83 ms`; `play`: `dsemu mean 17.14/17.17 -> 16.84/17.04 ms`.
+
+### Earlier handoff (`bench`)
 - **Repo / branch:** `G:\Emulacja\drastic-onion`, branch `bench` (uncommitted `onion/bench/`, `.gitignore`, `.gitattributes`, `NOTES.md`).
 - **Benchmark harness (`onion/bench/`):** `dsbench.c` -> `build/libdsbench.so`, `bench.sh`, `bench_ab.sh` (all LF, `bench.sh` protects `${ROM_BASE}_10.dss` / `.dsv` and restores `cpuclock 1200` + governor on exit; `dsbench.c` uses `__NR_ioctl` syscall 54 so no `dlsym` dependency).
 - **ROMs & saves backed up on PC:** 6 ROM `.zip`s in `G:\Emulacja\NDS\Roms\`, all `.dsv`/`.dss` (including GTA `_0.dss`, `_10.dss`, `.dsv`) in `G:\Emulacja\NDS\Saves\Drastic\`. `mlock` is free.
