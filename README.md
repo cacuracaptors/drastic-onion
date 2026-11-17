@@ -14,7 +14,8 @@ long play sessions on many devices before a final release. It was developed and 
 the **Mini v2/v3, Mini v4 and Mini Flip are untested**.
 
 Please open an issue with your device, OnionOS/RedOnion version, the games you played and for how long, and
-anything wrong: crashes, freezes, the device turning off, audio problems, slowdowns or stutters.
+anything wrong: crashes, freezes, the device turning off, audio problems, slowdowns or stutters. Please attach
+`Emu/NDS/dsfast.log` (written when you leave a game: screen mode, flip mode, measured refresh rate, frames per second).
 
 ## Install
 
@@ -45,7 +46,8 @@ All details, with the measurements behind each one, are in the comments at the t
 
 1. **Frame limiter** rewritten without the 10 ms kernel tick: the Miyoo's kernel wakes sleeping threads only
    every 10 ms, so DraStic's waits were too long. Waits now sleep only the safe part and spin for the rest.
-2. **Page flip without blocking** (3 framebuffer pages; the flip waits for the vsync in its own thread).
+2. **Page flip without blocking** (3 framebuffer pages; the flip waits for the vsync in its own thread), on the
+   640x480 screens and, since Beta 3, on the 752x560 screen of the Mini v4 and Flip.
 3. **Video thread woken as soon as a frame is ready** (instead of polling every 10 ms).
 4. **Limiter follows the screen**: the panel refreshes at ~59.67 Hz, not 60.
 5. **Sound stretched by the same 0.55%** so the sound chip never runs dry (no clicks).
@@ -59,6 +61,7 @@ All details, with the measurements behind each one, are in the comments at the t
 13. **A clock that never jumps back**: DraStic's own clock jumped back ~71 minutes every ~71.6 minutes of play
     and whenever the system time changed, which froze the game (fixed in Beta 2, reported and fixed by
     Kmieciu4ever).
+14. **Blur remembered**: the Blur/Pixel choice of the screen (MENU+B) is kept between sessions (Beta 3).
 
 The launcher (`launch.sh`) also:
 - sets the CPU clock by model: 1800 MHz on the Mini Plus, 1600 MHz on the Mini v2/v3/v4 and Flip;
