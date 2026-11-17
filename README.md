@@ -15,7 +15,8 @@ the **Mini v2/v3, Mini v4 and Mini Flip are untested**.
 
 Please open an issue with your device, OnionOS/RedOnion version, the games you played and for how long, and
 anything wrong: crashes, freezes, the device turning off, audio problems, slowdowns or stutters. Please attach
-`Emu/NDS/dsfast.log` (written when you leave a game: screen mode, flip mode, measured refresh rate, frames per second).
+`Emu/NDS/dsfast.log` (written when you leave a game: screen mode, flip mode, measured refresh rate, frames per second,
+device model, real CPU clock, emulation time per frame and frames skipped).
 
 ## Install
 
@@ -64,7 +65,9 @@ All details, with the measurements behind each one, are in the comments at the t
 14. **Blur remembered**: the Blur/Pixel choice of the screen (MENU+B) is kept between sessions (Beta 3).
 
 The launcher (`launch.sh`) also:
-- sets the CPU clock by model: 1800 MHz on the Mini Plus, 1600 MHz on the Mini v2/v3/v4 and Flip;
+- sets the CPU clock by model: 1800 MHz on the Mini Plus, 1600 MHz on the Mini v2/v3/v4 and Flip, and puts it back
+  to Onion's default (1200 MHz) and the previous CPU governor on exit, so the menu and other apps don't keep running
+  at the high clock (Beta 3.1);
 - reads the SD card 32 KB at a time and brings back one page per swap fault while DraStic runs (fewer stalls in
   big games such as GTA Chinatown Wars), restoring the system values on exit;
 - on the first start, sets in `config/drastic.cfg`: DraStic's 3D thread on (`threaded_3d = 1`) and automatic
@@ -93,6 +96,7 @@ clang --target=armv7a-linux-gnueabihf -mfloat-abi=hard -O2 -fPIC -shared -nostdl
 - Onion integration by Sichroteph and schmurtzm ([OnionUI/Onion](https://github.com/OnionUI/Onion)).
 - libdsfast by Régis ([cacuracaptors](https://github.com/cacuracaptors)), with Claude.
 - Long-session freeze fix (Beta 2) by Kmieciu4ever.
+- CPU clock restored on exit (Beta 3.1) by [ksielick](https://github.com/ksielick).
 
 ## License
 
