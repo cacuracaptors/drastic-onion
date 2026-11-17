@@ -4,14 +4,23 @@
 
 ## Handoff
 
-- **Active branch (`2026-11-17`):** `onion-dsfast` (`c4b1fc2f` committed; local uncommitted Tier 3b in `onion/dsfast.c` & `onion/dsfast_neon.S`, built to `scratch/libdsfast_t3.so` — NOT yet deployed to `/mnt/SDCARD/Emu/NDS/libs/libdsfast.so`). `mlock` is free.
-- **Tier 3b verified (`qemu-arm -B 0x100000000` all 9 kernels bit-exact + Miyoo 1800 MHz A/B vs Tier 2 `libdsfast.so`, `hires_3d=1`, `640x480` `32 bpp`):**
-  - `MKDS` (`slot 0`, `SHOT MD5 MATCH=True`): `dsemu mean 22.22/23.06 -> 21.05/21.27 ms` (`-1.48 ms`, `+3.1 fps`), `p50 21.21/22.01 -> 19.99/20.20 ms`, `p99 32.87/35.05 -> 31.33/31.02 ms`, `flip mean 22.16/22.98 -> 20.94/21.20 ms`; `--benchmark 300`: `Full 19.25 -> 18.13 ms`, `3D 10.38 -> 9.52 ms`, `2D 1.02 -> 0.86 ms`.
-  - `GTA_BRIDGE` (`slot 1`, `SHOT MD5 MATCH=True`): `--benchmark 300`: `Full 16.14 -> 15.61 ms`, `2D 3.53 -> 3.05 ms` (`-13.6%`), `3D 7.09 -> 6.75 ms`; `play`: `dsemu mean 21.59/21.55 -> 21.15/21.33 ms` (`p50 33.01/32.85 -> 32.33/32.27 ms`), `flip mean 22.80/22.81 -> 22.48/22.51 ms`.
-  - `GTA_OLD` (`slot 0`): `--benchmark 300`: `2D 3.04 -> 2.83 ms`; `play`: `dsemu mean 17.14/17.17 -> 16.84/17.04 ms`.
-
-### Earlier handoff (`bench`)
-- **Repo / branch:** `G:\Emulacja\drastic-onion`, branch `bench` (uncommitted `onion/bench/`, `.gitignore`, `.gitattributes`, `NOTES.md`).
+- **Repo / branch (`2026-11-17`):** `G:\Emulacja\drastic-onion`, branch `onion-dsfast` (HEAD `1628746e` `"Tier 3b: NEON+PLD 2D/3D kernels and hidden Engine B skip"`). Also clean PR branches on `origin` (`https://github.com/ksielick/drastic-onion`) -> `cacuracaptors/drastic-onion:onion-dsfast`:
+  - **PR #1:** `pr-fix-get-ticks-us-wrap` (`1f7207fa`) — 64-bit `mono_us()` + `wait_us` >300 ms guard (35.8-min freeze fix).
+  - **PR #2:** `pr-restore-cpuclock-on-exit` (`d8b2db2d`) — restore `cpuclock 1200` + `orig_gov` in `onion/launch.sh` (`trap EXIT INT TERM`).
+- **Device state (`192.168.0.246`, `mlock` FREE):**
+  - `/mnt/SDCARD/Emu/NDS/libs/libdsfast.so`: Tier 3b deployed (`18560 B`, `MD5 f5244eeb608dc11dc84b78c85b11a4b0`); `/mnt/SDCARD/Emu/NDS/libs/libSDL2-2.0.so.0`: Tier 2 CMA ping-pong + async `MI_GFX`; `/mnt/SDCARD/Emu/NDS/launch.sh`: `MD5 68ab2ec7bc3c0e4c2694e24b484b7939` (`cpuclock` restore verified via Game Switcher exit).
+  - `drastic.cfg`: `hires_3d = 1`, `frameskip_type = 2`, `frameskip_value = 1`, `threaded_3d = 1`, `screen_swap = 1` (32 bpp `ARGB8888`, `NDS_DIS_MODE_HRES1` 640x480).
+  - Owner's new GTA bridge save (`_1.dss`, `_10.dss`, `.dsv`) backed up at `G:\Emulacja\NDS\Saves\Drastic_new_bridge\`.
+- **Tier 3b verified (`qemu-arm -B 0x100000000` all 9 kernels bit-exact in `scratch/test_neon3d.c` + Miyoo 1800 MHz A/B vs Tier 2 `libdsfast.so`, `scratch/logs_tier3b/`):**
+  - `Mario Kart DS` (`slot 0`, `SHOT MD5 MATCH=True`): `dsemu mean 22.22/23.06 -> 21.05/21.27 ms` (`44.2 -> 47.3 fps`, `-1.48 ms`), `p50 21.21/22.01 -> 19.99/20.20 ms`, `p99 32.87/35.05 -> 31.33/31.02 ms`, `flip mean 22.16/22.98 -> 20.94/21.20 ms`; `--benchmark 300`: `Full 19.25 -> 18.13 ms`, `3D 10.38 -> 9.52 ms`, `2D 1.02 -> 0.86 ms`.
+  - `GTA: Chinatown Wars` bridge (`slot 1`, `SHOT MD5 MATCH=True`): `--benchmark 300`: `Full 16.14 -> 15.61 ms`, `2D 3.53 -> 3.05 ms` (`-13.6%`), `3D 7.09 -> 6.75 ms`; `play`: `dsemu mean 21.59/21.55 -> 21.15/21.33 ms` (`~46.4 -> ~47.1 DS fps`, `p50 33.01/32.85 -> 32.33/32.27 ms`), `flip mean 22.80/22.81 -> 22.48/22.51 ms` (still triggers `auto-frameskip`, ~4.5 ms short of 16.7 ms).
+  - `GTA: Chinatown Wars` old (`slot 0`): `--benchmark 300`: `2D 3.04 -> 2.83 ms`; `play`: `dsemu mean 17.14/17.17 -> 16.84/17.04 ms` (~59.0 DS fps, near zero frameskip).
+- **Profiling baselines captured (`scratch/logs_prof/`):** `mkds_samp.bin` (`5237` samples), `gta1_samp.bin` (`11295` samples), `gta1_lr.bin` (`3367` samples), `callprof_gta1.txt` (`cs_main=649`: 325 `0x08035fe8` Engine B + 324 `0x08078b30` 3D).
+  - *Audio startup pop cause verified:* [launch.sh](file:///G:/Emulacja/drastic-onion/onion/launch.sh#L12) calls `stop_audioserver.sh` (`pkill -9 audioserver`), then DraStic's `libs/libasound.so.2` (`snd_pcm_start`) calls `MI_AO_SetPubAttr` -> `MI_AO_Enable` -> `MI_AO_EnableChn` before `set_volume()` (hardware DAC DC bias jump). Long-term solution remains #10 (`48 kHz` `audioserver` FIFO).
+- **Next (Tier 3c candidates toward 60 fps in GTA bridge & MKDS):**
+  1. Re-profile **GTA bridge (`slot 1`)** with Tier 3b (`libdsfast.so`) using `sampler` to measure post-Tier-3b `Core 0` vs `Core 1` wait (`pthread_cond_wait` at `16.75%` when `main` `nice -5` may starve `w0` on `Core 0`), and test **dynamic 3D bin work-stealing** in `video_3d_render_bins_4x` (`0x080782dc..0x08078600`) so `Core 1` steals remaining bins instead of blocking on `w0` (`Core 0`).
+  2. Optimize remaining top 2D Main-Thread hotspots (`~3.05 ms` in GTA): `render_scanline_color_convert_direct_32_2x` (`0x080bf1c4`, zero `pld`s, stalled on `vst4.8`), `render_scanline_palette_lookup_8bpp` (`0x080bcab0`), `render_scanline_2d` (`0x0804b700` GCC C).
+  3. Investigate top 3D math/geometry hotspots shared by GTA & MKDS: `render_polygon_setup_perspective_steps` (`8.2%` GTA / `10.3%` MKDS), `setup_perspective_coefficients` (`6.4%` / `5.6%`), `interpolate_w` (`4.6%` / `4.2%`), `modulate` (`4.4%` / `5.3%`), `process_geometry_commands` (`0x0807ecd0` GCC C, `3.5%` Main Thread).
 - **Benchmark harness (`onion/bench/`):** `dsbench.c` -> `build/libdsbench.so`, `bench.sh`, `bench_ab.sh` (all LF, `bench.sh` protects `${ROM_BASE}_10.dss` / `.dsv` and restores `cpuclock 1200` + governor on exit; `dsbench.c` uses `__NR_ioctl` syscall 54 so no `dlsym` dependency).
 - **ROMs & saves backed up on PC:** 6 ROM `.zip`s in `G:\Emulacja\NDS\Roms\`, all `.dsv`/`.dss` (including GTA `_0.dss`, `_10.dss`, `.dsv`) in `G:\Emulacja\NDS\Saves\Drastic\`. `mlock` is free.
 - **Baselines measured on Miyoo (`cpuclock=1800`, `frameskip=0`, `threaded_3d=1`, `FRAMES=600`, `--skip 50`):**
