@@ -18,6 +18,8 @@
 #   SWAP        Optional override for screen_swap (0 or 1; default = drastic.cfg)
 #   SHOT        1 (default) to dump 640x480 BGRA fb0 page to /tmp/dsshot_<TAG>.bgra on end
 #   SDL2_DIR    Optional directory prepended to LD_LIBRARY_PATH (e.g. /tmp/sdl2_test)
+#   HOLD_MASK   Optional DraStic button mask held while recording (bit 4=A 5=B 6=X 7=Y 8=L 9=R)
+#   HOLD_FROM   Recorded frame at which the hold starts (default 0); HOLD_LEN frames to hold (0 = to the end)
 #   IR          Optional .ir input-playback path
 #   EXTRA_LIBS  Optional extra colon-separated .so paths for LD_PRELOAD
 #   EXTRA_ARGS  Optional extra CLI args for ./drastic (e.g. "--color-depth 16")
@@ -198,6 +200,8 @@ else
     export DSBENCH_FRAMES="$FRAMES"
     [ -n "$SLOT" ] && export DSBENCH_LOAD_SLOT="$SLOT"
     [ -n "$HOLD_MASK" ] && export DSBENCH_HOLD_MASK="$HOLD_MASK"
+    [ -n "$HOLD_FROM" ] && export DSBENCH_HOLD_FROM="$HOLD_FROM"
+    [ -n "$HOLD_LEN" ] && export DSBENCH_HOLD_LEN="$HOLD_LEN"
     [ "${SHOT:-1}" = "1" ] && export DSBENCH_SHOT="$SHOT_OUT"
 fi
 

@@ -188,6 +188,8 @@ static const char *shot_path;
 static int target_load_slot = -1;
 static int target_frames = 0;
 static int hold_mask = 0;
+static int hold_from = 0; /* recorded emu frame at which the hold starts */
+static int hold_len = 0;  /* frames to hold (0 = until the end) */
 
 static struct sample flip_samples[MAX_SAMPLES];
 static volatile u32 flip_count;
@@ -281,7 +283,8 @@ static u32 plat_in_tramp[4] __attribute__((aligned(16)));
 static void hook_platform_get_input(void *input)
 {
     ((void (*)(void *))(void *)plat_in_tramp)(input);
-    if (recording && hold_mask)
+    if (recording && hold_mask && (int)emu_count >= hold_from &&
+        (hold_len <= 0 || (int)emu_count < hold_from + hold_len))
         *(u32 *)((u8 *)input + INPUT_BTN_OFFSET) |= (u32)hold_mask;
 }
 static void hook_update_input(void *input)
@@ -355,6 +358,8 @@ __attribute__((constructor)) static void dsbench_init(void)
     target_load_slot = parse_int(getenv("DSBENCH_LOAD_SLOT"), -1);
     target_frames = parse_int(getenv("DSBENCH_FRAMES"), 0);
     hold_mask = parse_int(getenv("DSBENCH_HOLD_MASK"), 0);
+    hold_from = parse_int(getenv("DSBENCH_HOLD_FROM"), 0);
+    hold_len = parse_int(getenv("DSBENCH_HOLD_LEN"), 0);
 
     if (!log_flip_path && !log_emu_path && target_load_slot < 0 && target_frames <= 0)
         return;
