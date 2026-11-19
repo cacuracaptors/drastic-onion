@@ -708,11 +708,16 @@ static int *sdl_down_scale;
 
 static void blur_setup(void)
 {
-    u8 *init = (u8 *)dlsym((void *)0, "SDL_Init");
-    /* only with the libSDL2 v1.8 build (same check as in hide_setup) */
-    if (!init || *(u32 *)(init - 0x35470 + 0xe6178) != 0xe92d4ff0u)
-        return;
-    sdl_down_scale = (int *)(init - 0x35470 + 0x122f38);
+    int *(*get_ds)(void) = (int *(*)(void))dlsym((void *)0, "mmiyoo_get_down_scale");
+    if (get_ds) {
+        sdl_down_scale = get_ds();
+    } else {
+        u8 *init = (u8 *)dlsym((void *)0, "SDL_Init");
+        /* fallback for stock libSDL2 v1.8 build (same check as in hide_setup) */
+        if (!init || *(u32 *)(init - 0x35470 + 0xe6178) != 0xe92d4ff0u)
+            return;
+        sdl_down_scale = (int *)(init - 0x35470 + 0x122f38);
+    }
     if (*sdl_down_scale != 0 && *sdl_down_scale != 1) {   /* not the variable we expect */
         sdl_down_scale = 0;
         return;
@@ -1217,14 +1222,17 @@ extern void dsfast_engine_b_tramp(void);
 static void hide_setup(void)
 {
     int *(*get_dm)(void) = (int *(*)(void))dlsym((void *)0, "mmiyoo_get_dis_mode");
+    int *(*get_nds)(void) = (int *(*)(void))dlsym((void *)0, "mmiyoo_get_nds");
     u8 *init = (u8 *)dlsym((void *)0, "SDL_Init");
     const char *noeb = getenv("DSFAST_NO_SKIPEB");
     if (noeb && noeb[0] == '1')
         no_skipeb = 1;
     if (get_dm)
         sdl_dis_mode = get_dm();
+    if (get_nds)
+        sdl_nds = get_nds();     /* rebuilt libSDL2: no fixed offsets; sdl_base stays 0, so copy_thread stays off */
     /* with stock libSDL2 v1.8: SDL_Init at 0x35470, process_screen (push r4-r11, lr) at 0xe6178 */
-    if (init && *(u32 *)(init - 0x35470 + 0xe6178) == 0xe92d4ff0u) {
+    else if (init && *(u32 *)(init - 0x35470 + 0xe6178) == 0xe92d4ff0u) {
         sdl_nds = (int *)(init - 0x35470 + 0x16e4a0);
         sdl_base = init - 0x35470;
     }
