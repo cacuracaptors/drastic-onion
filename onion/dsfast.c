@@ -591,11 +591,16 @@ static int *sdl_down_scale;
 
 static void blur_setup(void)
 {
-    u8 *init = (u8 *)dlsym((void *)0, "SDL_Init");
-    /* only with the libSDL2 v1.8 build (same check as in hide_setup) */
-    if (!init || *(u32 *)(init - 0x35470 + 0xe6178) != 0xe92d4ff0u)
-        return;
-    sdl_down_scale = (int *)(init - 0x35470 + 0x122f38);
+    int *(*get_ds)(void) = (int *(*)(void))dlsym((void *)0, "mmiyoo_get_down_scale");
+    if (get_ds) {
+        sdl_down_scale = get_ds();
+    } else {
+        u8 *init = (u8 *)dlsym((void *)0, "SDL_Init");
+        /* fallback for stock libSDL2 v1.8 build (same check as in hide_setup) */
+        if (!init || *(u32 *)(init - 0x35470 + 0xe6178) != 0xe92d4ff0u)
+            return;
+        sdl_down_scale = (int *)(init - 0x35470 + 0x122f38);
+    }
     if (*sdl_down_scale != 0 && *sdl_down_scale != 1) {   /* not the variable we expect */
         sdl_down_scale = 0;
         return;
@@ -997,12 +1002,17 @@ static void split_finish_rendering(void *v3d)
 
 static void hide_setup(void)
 {
-    u8 *init = (u8 *)dlsym((void *)0, "SDL_Init");
-    /* only with the libSDL2 v1.8 build: SDL_Init at 0x35470, process_screen (push r4-r11, lr) at 0xe6178 */
-    if (!init || *(u32 *)(init - 0x35470 + 0xe6178) != 0xe92d4ff0u)
-        return;
-    sdl_nds = (int *)(init - 0x35470 + 0x16e4a0);
-    sdl_base = init - 0x35470;
+    int *(*get_nds)(void) = (int *(*)(void))dlsym((void *)0, "mmiyoo_get_nds");
+    if (get_nds) {
+        sdl_nds = get_nds();
+    } else {
+        u8 *init = (u8 *)dlsym((void *)0, "SDL_Init");
+        /* only with the libSDL2 v1.8 build: SDL_Init at 0x35470, process_screen (push r4-r11, lr) at 0xe6178 */
+        if (!init || *(u32 *)(init - 0x35470 + 0xe6178) != 0xe92d4ff0u)
+            return;
+        sdl_nds = (int *)(init - 0x35470 + 0x16e4a0);
+        sdl_base = init - 0x35470;
+    }
     hide_tramp[0] = *(u32 *)FN_RENDER_SCANLINE;         /* strd r4, r5, [sp, #-36]! */
     hide_tramp[1] = *(u32 *)(FN_RENDER_SCANLINE + 4);   /* movw r5, #0x2008 */
     hide_tramp[2] = 0xe51ff004;                          /* ldr pc, [pc, #-4] */
