@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Stop"
-$gcc = "G:\Emulacja\redriver2-miyoo\deps\arm-gnu-toolchain-13.3.rel1-mingw-w64-i686-arm-none-linux-gnueabihf\bin\arm-none-linux-gnueabihf-gcc.exe"
+$gcc = if ($env:ARM_GCC) { $env:ARM_GCC } else { "arm-none-linux-gnueabihf-gcc" }
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $outDir = Join-Path $here "build"
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
