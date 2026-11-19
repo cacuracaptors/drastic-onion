@@ -5,7 +5,7 @@
 #
 # Per-variant overrides for A, B, C, D (only A and B run unless C/D are defined):
 #   <V>_DSFAST, <V>_EXTRA_LIBS, <V>_EXTRA_ARGS, <V>_MHZ, <V>_RAW_VM,
-#   <V>_LAYOUT, <V>_FRAMESKIP, <V>_THREADED3D, <V>_HIRES3D, <V>_SWAP, <V>_SDL2_DIR, <V>_MODE
+#   <V>_LAYOUT, <V>_FRAMESKIP, <V>_THREADED3D, <V>_HIRES3D, <V>_SWAP, <V>_SDL2_DIR, <V>_MODE, <V>_HOLD_MASK
 
 OUT=/tmp/dsbench_ab.txt
 : > "$OUT"
@@ -36,12 +36,14 @@ while [ "$r" -lt "$ROUNDS" ]; do
         eval "v_swap=\${${v}_SWAP:-${SWAP:-}}"
         eval "v_sdl2=\${${v}_SDL2_DIR:-${SDL2_DIR:-}}"
         eval "v_mode=\${${v}_MODE:-${MODE:-play}}"
+        eval "v_hold=\${${v}_HOLD_MASK:-${HOLD_MASK:-}}"
         if [ "$r" = "1" ]; then v_shot=${SHOT:-1}; else v_shot=0; fi
 
         tag="${v}_r${r}"
         TAG="$tag" DSFAST="$v_dsfast" EXTRA_LIBS="$v_libs" EXTRA_ARGS="$v_args" \
             MHZ="$v_mhz" RAW_VM="$v_rawvm" LAYOUT="$v_layout" FRAMESKIP="$v_fs" \
-            THREADED3D="$v_t3d" HIRES3D="$v_h3d" SWAP="$v_swap" SDL2_DIR="$v_sdl2" SHOT="$v_shot" MODE="$v_mode" \
+            THREADED3D="$v_t3d" HIRES3D="$v_h3d" SWAP="$v_swap" SDL2_DIR="$v_sdl2" \
+            HOLD_MASK="$v_hold" SHOT="$v_shot" MODE="$v_mode" \
             sh /tmp/bench.sh
 
         {
