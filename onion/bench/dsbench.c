@@ -30,7 +30,9 @@ extern char *getenv(const char *name);
 #define FN_QUIT             0x08006444u
 #define FN_LOAD_STATE_INDEX 0x08095ce4u
 #define FN_UPDATE_INPUT     0x080a65e0u
+#define FN_PLATFORM_INPUT   0x080a8c30u
 #define INPUT_SYS_OFFSET    0x80004u
+#define INPUT_BTN_OFFSET    0x80008u
 
 #define MAX_SAMPLES 32768
 
@@ -185,6 +187,7 @@ static const char *log_emu_path;
 static const char *shot_path;
 static int target_load_slot = -1;
 static int target_frames = 0;
+static int hold_mask = 0;
 
 static struct sample flip_samples[MAX_SAMPLES];
 static volatile u32 flip_count;
@@ -274,6 +277,13 @@ int ioctl(int fd, unsigned long req, void *arg)
 }
 
 static u32 input_tramp[4] __attribute__((aligned(16)));
+static u32 plat_in_tramp[4] __attribute__((aligned(16)));
+static void hook_platform_get_input(void *input)
+{
+    ((void (*)(void *))(void *)plat_in_tramp)(input);
+    if (recording && hold_mask)
+        *(u32 *)((u8 *)input + INPUT_BTN_OFFSET) |= (u32)hold_mask;
+}
 static void hook_update_input(void *input)
 {
     void *sys = *(void **)((u8 *)input + INPUT_SYS_OFFSET);
@@ -344,9 +354,20 @@ __attribute__((constructor)) static void dsbench_init(void)
     shot_path = getenv("DSBENCH_SHOT");
     target_load_slot = parse_int(getenv("DSBENCH_LOAD_SLOT"), -1);
     target_frames = parse_int(getenv("DSBENCH_FRAMES"), 0);
+    hold_mask = parse_int(getenv("DSBENCH_HOLD_MASK"), 0);
 
     if (!log_flip_path && !log_emu_path && target_load_slot < 0 && target_frames <= 0)
         return;
+
+    if (hold_mask && *(u32 *)FN_PLATFORM_INPUT == 0xe16d42f4u) {
+        plat_in_tramp[0] = *(u32 *)FN_PLATFORM_INPUT;
+        plat_in_tramp[1] = *(u32 *)(FN_PLATFORM_INPUT + 4);
+        plat_in_tramp[2] = 0xe51ff004;
+        plat_in_tramp[3] = FN_PLATFORM_INPUT + 8;
+        mprotect((void *)((u32)plat_in_tramp & ~4095u), 4096, 7);
+        flush_icache(plat_in_tramp, plat_in_tramp + 4);
+        patch(FN_PLATFORM_INPUT, (void *)hook_platform_get_input);
+    }
 
     input_tramp[0] = *(u32 *)FN_UPDATE_INPUT;       /* strd r4, [sp, #-36]! */
     input_tramp[1] = *(u32 *)(FN_UPDATE_INPUT + 4); /* add r5, r0, #0x80000 */

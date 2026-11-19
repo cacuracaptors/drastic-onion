@@ -168,6 +168,19 @@ int snd_lib_error_set_handler(int handler)
 #endif
 
 #ifdef MMIYOO
+static void mute_mi_ao(void)
+{
+    int fd = open("/dev/mi_ao", O_RDWR);
+    if (fd >= 0) {
+        int buf2[] = {0, MIN_RAW_VALUE};
+        uint64_t buf1[] = {sizeof(buf2), (uintptr_t)buf2};
+        ioctl(fd, MI_AO_SETVOLUME, buf1);
+        buf2[1] = 1;
+        ioctl(fd, MI_AO_SETMUTE, buf1);
+        close(fd);
+    }
+}
+
 static int set_volume_raw(int value, int add)
 {
     int fd = -1;
@@ -195,21 +208,10 @@ static int set_volume_raw(int value, int add)
         value = MIN_RAW_VALUE;
     }
 
-    if (value == prev_value) {
-        close(fd);
-        return prev_value;
-    }
-
     buf2[1] = value;
     ioctl(fd, MI_AO_SETVOLUME, buf1);
-    if (prev_value <= MIN_RAW_VALUE && value > MIN_RAW_VALUE) {
-        buf2[1] = 0;
-        ioctl(fd, MI_AO_SETMUTE, buf1);
-    }
-    else if (prev_value > MIN_RAW_VALUE && value <= MIN_RAW_VALUE) {
-        buf2[1] = 1;
-        ioctl(fd, MI_AO_SETMUTE, buf1);
-    }
+    buf2[1] = (value <= MIN_RAW_VALUE) ? 1 : 0;
+    ioctl(fd, MI_AO_SETMUTE, buf1);
     close(fd);
     return value;
 }
@@ -550,6 +552,7 @@ int snd_pcm_start(snd_pcm_t *pcm)
 #endif
 
 #if defined(MMIYOO) && !defined(UNITTEST)
+    mute_mi_ao();
     stSetAttr.eBitwidth = E_MI_AUDIO_BIT_WIDTH_16;
     stSetAttr.eWorkmode = E_MI_AUDIO_MODE_I2S_MASTER;
     stSetAttr.u32FrmNum = 6;
@@ -587,6 +590,15 @@ int snd_pcm_start(snd_pcm_t *pcm)
     stAoChn0OutputPort0.u32ChnId = AoChn;
     stAoChn0OutputPort0.u32PortId = 0;
     MI_SYS_SetChnOutputPortDepth(&stAoChn0OutputPort0, 12, 13);
+    {
+        MI_AUDIO_Frame_t silence = {0};
+        silence.eBitwidth = stGetAttr.eBitwidth;
+        silence.eSoundmode = stGetAttr.eSoundmode;
+        silence.u32Len = pcm_buf_len;
+        silence.apVirAddr[0] = pcm_buf;
+        MI_AO_SendFrame(AoDevId, AoChn, &silence, 1);
+    }
+    usleep(20000);
     set_volume(cur_volume);
 #endif
 
@@ -669,6 +681,8 @@ int snd_pcm_close(snd_pcm_t *pcm)
     queue_destroy(&queue);
 
 #if defined(MMIYOO) && !defined(UNITTEST)
+    mute_mi_ao();
+    usleep(20000);
     MI_AO_DisableChn(AoDevId, AoChn);
     MI_AO_Disable(AoDevId);
 #endif

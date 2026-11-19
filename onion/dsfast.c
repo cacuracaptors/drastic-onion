@@ -169,7 +169,7 @@ snd_sframes snd_pcm_writei(void *pcm, const void *buffer, unsigned long size)
     if (!active || size < 2 || size > 4096)
         return real_writei(pcm, buffer, size);
     now = mono_us();
-    if (!a_t0 || now - a_tlast > 200000) {   /* start, or sound was stopped (menu, loading) */
+    if (!a_t0 || now - a_tlast > 80000) {    /* start, or sound was stopped (menu, loading, savestate) */
         a_t0 = now;
         a_written = 0;
         a_last[0] = in[0];
@@ -261,14 +261,33 @@ static void wait_us(u32 us)
     while (t - t0 < (s64)us);
 }
 
-static void frame_sync(void *sys)
+static s64 last_sync_exit_us;
+static s64 prev_work_us;
+static u32 pair30_score;
+static int no_pair30;
+
+static void frame_sync(void *sys, s64 work_us)
 {
     s64 *target = (s64 *)((char *)sys + 0x2aeae50);
     void *audio = (char *)sys + 0x1566000;
     u32 skip_type, skip_value, interval, astate;
     s32 delta;
-    int late;
+    int late, is_30fps;
     s64 t, now, tgt;
+
+    if (work_us > 0 && work_us < 150000) {
+        if ((work_us < 12000 && prev_work_us > 18000) || (work_us > 18000 && prev_work_us < 12000)) {
+            if (pair30_score < 16)
+                pair30_score += 2;
+        } else if (pair30_score > 0) {
+            pair30_score--;
+        }
+        prev_work_us = work_us;
+    } else {
+        pair30_score = 0;
+        prev_work_us = 0;
+    }
+    is_30fps = !no_pair30 && (pair30_score >= 6);
 
     interval = CFG(sys, FRAME_INTERVAL);
     astate = audio_buffer_state(audio);
@@ -329,10 +348,19 @@ timer:
         *target = now;
         delta = 0;
     }
-    if (delta > 0)
-        wait_us((u32)delta / 3);
-    else if (delta < -18000)   /* 6 ms late (DraStic: 3 ms), see section 12 */
+    if (delta > 0) {
+        if (is_30fps && work_us > 0 && work_us < 12000) {
+            /* 30 fps games (e.g. GTA) alternate a ~6 ms light frame and a ~27 ms 3D frame:
+             * lend up to 1 refresh of slack from the light frame so the heavy frame starts
+             * immediately instead of sleeping ~10 ms and missing the 33.52 ms pair deadline. */
+            if (delta > (s32)interval)
+                wait_us((u32)(delta - (s32)interval) / 3);
+        } else {
+            wait_us((u32)delta / 3);
+        }
+    } else if (delta < -18000) {   /* 6 ms late (DraStic: 3 ms), see section 12 */
         late = 1;
+    }
     goto frameskip;
 
 audio_paced:
@@ -388,9 +416,12 @@ frameskip:
 static void *g_sys;
 void dsfast_system_frame_sync(void *sys)
 {
+    s64 enter_us = mono_us();
+    s64 work_us = last_sync_exit_us ? (enter_us - last_sync_exit_us) : 0;
     g_sys = sys;
     frame_ready();
-    frame_sync(sys);
+    frame_sync(sys, work_us);
+    last_sync_exit_us = mono_us();
 }
 
 /* ------------------------------------------------------------------ 2. page flip */
@@ -858,6 +889,11 @@ __attribute__((constructor)) static void dsfast_init(void)
     if (*(u32 *)FN_SYSTEM_FRAME_SYNC != 0xe16d42f4u)
         return;
     active = 1;
+    {
+        const char *env_p = getenv("DSFAST_NO_PAIR30");
+        if (env_p && env_p[0] == '1')
+            no_pair30 = 1;
+    }
     set_core(CORE0);   /* the emulation; threads it creates are placed in pthread_create */
     sys3(97, 0, 0, -5); /* setpriority: keep Core 0 priority above w0 3D helper (nice 0) */
     if (*(u32 *)FN_GET_TICKS_US == 0xe16d40fcu)

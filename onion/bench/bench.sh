@@ -66,7 +66,7 @@ SET_BAK=/tmp/settings.json.bench_bak
 
 SYS_JSON=/mnt/SDCARD/system.json
 orig_vol=""
-if [ -f "$SYS_JSON" ]; then
+if [ "${NO_MUTE:-0}" != "1" ] && [ -f "$SYS_JSON" ]; then
     orig_vol=$(sed -n 's/^[[:space:]]*"vol":[[:space:]]*\([0-9]*\).*/\1/p' "$SYS_JSON" | head -n 1)
     if [ -n "$orig_vol" ] && [ "$orig_vol" != "0" ]; then
         sed 's/^\([[:space:]]*"vol":[[:space:]]*\)[0-9][0-9]*/\10/' "$SYS_JSON" > "$SYS_JSON.tmp" &&
@@ -197,6 +197,7 @@ else
     export DSBENCH_EMU_LOG="$EMU_LOG"
     export DSBENCH_FRAMES="$FRAMES"
     [ -n "$SLOT" ] && export DSBENCH_LOAD_SLOT="$SLOT"
+    [ -n "$HOLD_MASK" ] && export DSBENCH_HOLD_MASK="$HOLD_MASK"
     [ "${SHOT:-1}" = "1" ] && export DSBENCH_SHOT="$SHOT_OUT"
 fi
 
