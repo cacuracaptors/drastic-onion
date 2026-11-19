@@ -800,7 +800,8 @@ static void set_core(unsigned long mask) { sys3(241, 0, sizeof(mask), (long)&mas
 #define FN_VIDEO_RENDER_THREAD 0x080287e0u     /* 2D, hands over to the emulation and waits */
 #define FN_VIDEO_3D_RENDER_THREAD 0x080782dcu  /* 3D helper threads (initialize_video_3d always makes 3) */
 static int helpers_seen;
-struct tramp { void *(*fn)(void *); void *arg; unsigned long mask; };
+static int use_nice = 1;
+struct tramp { void *(*fn)(void *); void *arg; unsigned long mask; int nice; };
 extern void *malloc(unsigned int n);
 extern void free(void *p);
 static void *tramp_run(void *p)
@@ -808,6 +809,10 @@ static void *tramp_run(void *p)
     struct tramp t = *(struct tramp *)p;
     free(p);
     set_core(t.mask);
+    /* Main sets -5 before spawning threads, which clone() inherits; reset each child
+     * explicitly so flip (-8) > Main (-5) == Engine B (-5) > w0 (+5), and others stay at 0. */
+    if (use_nice)
+        sys3(97, 0, 0, t.nice);
     return t.fn(t.arg);
 }
 int pthread_create(unsigned long *th, void *attr, void *(*fn)(void *), void *arg)
@@ -815,18 +820,28 @@ int pthread_create(unsigned long *th, void *attr, void *(*fn)(void *), void *arg
     static int (*real)(unsigned long *, void *, void *(*)(void *), void *);
     u32 a = (u32)fn;
     unsigned long mask = CORE1;   /* 3D (video_3d_run_thread, video_3d_render_thread), SDL audio and video... */
+    int nice = 0;
     struct tramp *t;
     if (!real)
         real = (int (*)(unsigned long *, void *, void *(*)(void *), void *))dlsym(RTLD_NEXT, "pthread_create");
-    if (a == FN_VIDEO_RENDER_THREAD || fn == flip_thread)
+    if (a == FN_VIDEO_RENDER_THREAD) {
         mask = CORE0;
-    if (a == FN_VIDEO_3D_RENDER_THREAD && helpers_seen++ == 0)
+        nice = -5;                /* match Main (-5) so Engine B 2D never stalls behind Main */
+    }
+    if (fn == flip_thread) {
+        mask = CORE0;
+        nice = -8;                /* never miss a vsync pan behind Main/2D */
+    }
+    if (a == FN_VIDEO_3D_RENDER_THREAD && helpers_seen++ == 0) {
         mask = CORE0;             /* 11. the first 3D helper (bins 1, 4, 7...) runs next to the emulation */
+        nice = 5;                 /* idle-fill on core 0: never preempt flip (-8), Main (-5), or Engine B (-5) */
+    }
     if (!active || !(t = (struct tramp *)malloc(sizeof(*t))))
         return real(th, attr, fn, arg);
     t->fn = fn;
     t->arg = arg;
     t->mask = mask;
+    t->nice = nice;
     return real(th, attr, tramp_run, t);
 }
 
@@ -920,15 +935,26 @@ static void copy_setup_late(void)
 #define FN_RENDER_SCANLINE 0x0804c9f0u
 #define DS_SCREENS 0x0aee952cu   /* DraStic's 2 screens, 28 bytes each: +4 pixels, +0x19 high-res mode */
 static int *sdl_nds;             /* libSDL2 v1.8 'nds' struct, dis_mode at +0x10 */
+static int *sdl_dis_mode;        /* direct &nds.dis_mode when mmiyoo_get_dis_mode() is exported */
+static int no_skipeb;
 static u32 hide_tramp[4] __attribute__((aligned(16)));   /* render_scanline's first 2 instructions + jump back */
 static u8 *volatile hide_a, *volatile hide_a_cap;   /* engine A (the one with 3D) and its capture settings */
 static int hidden_screen(void)
 {
-    /* high-resolution 3D (hires_3d = 1, either screen at 512x384): DraStic composes the screens its own way and
-       skipping one drew garbage on both, so nothing is skipped then */
-    if (*(u8 *)(DS_SCREENS + 0x19) || *(u8 *)(DS_SCREENS + 28 + 0x19))
+    u8 h0 = *(u8 *)(DS_SCREENS + 0x19);
+    u8 h1 = *(u8 *)(DS_SCREENS + 28 + 0x19);
+    int dm;
+    if (!no_skipeb) {
+        if (h0 && !h1)
+            return 1;
+        if (h1)
+            return 0;
+    } else if (h0 || h1) {
+        /* DSFAST_NO_SKIPEB=1: keep Beta 4's hires_3d guard */
         return -1;
-    if (sdl_nds[4] == 2 || sdl_nds[4] == 3)           /* NDS_DIS_MODE_S0 / S1 */
+    }
+    dm = sdl_dis_mode ? *sdl_dis_mode : (sdl_nds ? sdl_nds[4] : -1);
+    if (dm == 2 || dm == 3)           /* NDS_DIS_MODE_S0 / S1 */
         return 0;
     return -1;
 }
@@ -980,6 +1006,7 @@ static void hide3d_start_rendering(void *v3d, u32 arg)
 #define CFG_BATCH_3D 0x7b4
 static u32 split_tramp[4] __attribute__((aligned(16)));
 static u32 split_hist;
+static u32 batch3d_max = 3;
 static void split_finish_rendering(void *v3d)
 {
     s64 t0 = mono_us();
@@ -991,18 +1018,52 @@ static void split_finish_rendering(void *v3d)
     split_hist = h;
     for (c = 0, x = h & 0xffff; x; x &= x - 1)
         c++;
-    if (g_sys)
-        CFG(g_sys, CFG_BATCH_3D) = c >= 4 ? 3 : c == 0 ? 1 : CFG(g_sys, CFG_BATCH_3D) == 3 ? 3 : 1;
+    if (g_sys) {
+        u32 n = batch3d_max;
+        CFG(g_sys, CFG_BATCH_3D) = c >= 4 ? n : c == 0 ? 1 : CFG(g_sys, CFG_BATCH_3D) == n ? n : 1;
+    }
 }
+
+__attribute__((visibility("hidden"))) int dsfast_should_skip_eb(const u8 *video)
+{
+    int hidden = hidden_screen();
+    if (hidden < 0)
+        return 0;
+    return *(void *const *)(video + 0x82d30 + 0x1c) == *(void *const *)(DS_SCREENS + 28 * hidden + 4);
+}
+
+/* Called by dsfast_engine_b_tramp after skipping hidden Engine B: run video_2d_render_scanlines on it
+   with screen_ptr (v2d +0x1c) cleared, as DraStic does for a skipped frame, so its event queue (deferred
+   palette, OAM and 2D register writes of this frame) still reaches palette_ram / the engine state but
+   nothing is drawn. A POWCNT1 event in the queue may set a new screen_ptr: keep that one. */
+__attribute__((visibility("hidden"))) void dsfast_eb_events_only(u8 *video)
+{
+    u8 *v2d = video + 0x82d30;
+    void *saved = *(void **)(v2d + 0x1c);
+    *(void **)(v2d + 0x1c) = 0;
+    ((void (*)(u8 *, u32, u32, void *))0x0804f480u)(v2d, 0, 191, 0);
+    if (!*(void **)(v2d + 0x1c))
+        *(void **)(v2d + 0x1c) = saved;
+}
+
+extern void dsfast_engine_b_tramp(void);
 
 static void hide_setup(void)
 {
+    int *(*get_dm)(void) = (int *(*)(void))dlsym((void *)0, "mmiyoo_get_dis_mode");
     u8 *init = (u8 *)dlsym((void *)0, "SDL_Init");
-    /* only with the libSDL2 v1.8 build: SDL_Init at 0x35470, process_screen (push r4-r11, lr) at 0xe6178 */
-    if (!init || *(u32 *)(init - 0x35470 + 0xe6178) != 0xe92d4ff0u)
+    const char *noeb = getenv("DSFAST_NO_SKIPEB");
+    if (noeb && noeb[0] == '1')
+        no_skipeb = 1;
+    if (get_dm)
+        sdl_dis_mode = get_dm();
+    /* with stock libSDL2 v1.8: SDL_Init at 0x35470, process_screen (push r4-r11, lr) at 0xe6178 */
+    if (init && *(u32 *)(init - 0x35470 + 0xe6178) == 0xe92d4ff0u) {
+        sdl_nds = (int *)(init - 0x35470 + 0x16e4a0);
+        sdl_base = init - 0x35470;
+    }
+    if (!sdl_dis_mode && !sdl_nds && no_skipeb)
         return;
-    sdl_nds = (int *)(init - 0x35470 + 0x16e4a0);
-    sdl_base = init - 0x35470;
     hide_tramp[0] = *(u32 *)FN_RENDER_SCANLINE;         /* strd r4, r5, [sp, #-36]! */
     hide_tramp[1] = *(u32 *)(FN_RENDER_SCANLINE + 4);   /* movw r5, #0x2008 */
     hide_tramp[2] = 0xe51ff004;                          /* ldr pc, [pc, #-4] */
@@ -1017,6 +1078,8 @@ static void hide_setup(void)
     mprotect((void *)((u32)hide3d_tramp & ~4095u), 8192, 7);
     flush_icache(hide3d_tramp, hide3d_tramp + 4);
     patch(FN_VIDEO_3D_START_RENDERING, (void *)hide3d_start_rendering);
+    if (!no_skipeb && *(u32 *)0x08035facu == 0xe59d9008u && *(u32 *)0x08035fb0u == 0xe30a8c98u)
+        patch(0x08035facu, (void *)dsfast_engine_b_tramp);
 }
 
 /* ------------------------------------------------------------------ 17. where a frame's time goes (DSFAST_PROF=1)
@@ -1059,6 +1122,66 @@ static void prof_frame(u32 w, int counted, int drawn_next)
     pf_2d = pf_wait3d = pf_lines = 0;
     prof_drawn = drawn_next;
 }
+/* ------------------------------------------------------------------ 18. 3D 4x bin work-stealing
+   Replace static modulo assignment (bin i -> thread i % count) in video_3d_render_bins_4x with an
+   atomic 0..11 bin counter when multi-threaded 3D is active. Because Main Thread runs at nice -5 on
+   core 0, helper w0 sleeps while core 0 finishes CPU/Geom/2D; work-stealing lets core 1 claim bins
+   1..11 without stalling on w0, while w0 picks up remaining bins as soon as main hits finish_rendering. */
+#define FN_VIDEO_3D_RENDER_BINS_4X 0x08077b80u
+#define FN_UPDATE_FRAME_3D_4X_PREP 0x080785acu
+extern volatile u32 dsfast_next_bin;
+extern void dsfast_prep_bins_4x(void);
+static int steal3d_on;
+static u32 steal_tramp[4] __attribute__((aligned(16)));
+
+static void dsfast_render_bins_4x(u8 *rt)
+{
+    void (*orig)(u8 *) = (void (*)(u8 *))(void *)steal_tramp;
+    u8 orig_base = rt[0x240aa];
+    u8 orig_inter = rt[0x240ab];
+    s64 t = prof_on ? mono_us() : 0;
+    if (orig_inter <= 1) {
+        orig(rt);
+        if (prof_on)
+            __sync_fetch_and_add(&pf_3d, (u32)(mono_us() - t));
+        return;
+    }
+    rt[0x240ab] = 12; /* __aeabi_idiv(12, 12) == 1 bin per call */
+    for (;;) {
+        u32 bin = __atomic_fetch_add(&dsfast_next_bin, 1, __ATOMIC_RELAXED);
+        if (bin >= 12)
+            break;
+        rt[0x240aa] = (u8)bin;
+        orig(rt);
+    }
+    rt[0x240aa] = orig_base;
+    rt[0x240ab] = orig_inter;
+    if (prof_on)
+        __sync_fetch_and_add(&pf_3d, (u32)(mono_us() - t));
+}
+
+static void steal3d_setup(void)
+{
+    const char *off = getenv("DSFAST_NO_STEAL");
+    if (off && off[0] == '1')
+        return;
+    if (*(u32 *)FN_UPDATE_FRAME_3D_4X_PREP != 0xe5943004u ||
+        *(u32 *)(FN_UPDATE_FRAME_3D_4X_PREP + 4) != 0xe285296fu)
+        return;
+    if (*(u32 *)FN_VIDEO_3D_RENDER_BINS_4X != 0xe2803909u ||
+        *(u32 *)(FN_VIDEO_3D_RENDER_BINS_4X + 4) != 0xe16d42f4u)
+        return;
+    steal_tramp[0] = *(u32 *)FN_VIDEO_3D_RENDER_BINS_4X;       /* add r3, r0, #0x24000 */
+    steal_tramp[1] = *(u32 *)(FN_VIDEO_3D_RENDER_BINS_4X + 4); /* strd r4, [sp, #-36]! */
+    steal_tramp[2] = 0xe51ff004u;
+    steal_tramp[3] = FN_VIDEO_3D_RENDER_BINS_4X + 8;
+    mprotect((void *)((u32)steal_tramp & ~4095u), 8192, 7);
+    flush_icache(steal_tramp, steal_tramp + 4);
+    patch(FN_UPDATE_FRAME_3D_4X_PREP, (void *)dsfast_prep_bins_4x);
+    patch(FN_VIDEO_3D_RENDER_BINS_4X, (void *)dsfast_render_bins_4x);
+    steal3d_on = 1;
+}
+
 static void prof_setup(void)
 {
     if (!getenv("DSFAST_PROF"))
@@ -1068,20 +1191,29 @@ static void prof_setup(void)
     bins1_tramp[1] = *(u32 *)(FN_RENDER_BINS_1X + 4);    /* strd r4, r5, [sp, #-36]! */
     bins1_tramp[2] = 0xe51ff004;
     bins1_tramp[3] = FN_RENDER_BINS_1X + 8;
-    bins4_tramp[0] = *(u32 *)FN_RENDER_BINS_4X;
-    bins4_tramp[1] = *(u32 *)(FN_RENDER_BINS_4X + 4);
-    bins4_tramp[2] = 0xe51ff004;
-    bins4_tramp[3] = FN_RENDER_BINS_4X + 8;
     mprotect((void *)((u32)bins1_tramp & ~4095u), 8192, 7);
-    mprotect((void *)((u32)bins4_tramp & ~4095u), 8192, 7);
     flush_icache(bins1_tramp, bins1_tramp + 4);
-    flush_icache(bins4_tramp, bins4_tramp + 4);
     patch(FN_RENDER_BINS_1X, (void *)prof_bins1);
-    patch(FN_RENDER_BINS_4X, (void *)prof_bins4);
+    if (!steal3d_on) {
+        bins4_tramp[0] = *(u32 *)FN_RENDER_BINS_4X;
+        bins4_tramp[1] = *(u32 *)(FN_RENDER_BINS_4X + 4);
+        bins4_tramp[2] = 0xe51ff004;
+        bins4_tramp[3] = FN_RENDER_BINS_4X + 8;
+        mprotect((void *)((u32)bins4_tramp & ~4095u), 8192, 7);
+        flush_icache(bins4_tramp, bins4_tramp + 4);
+        patch(FN_RENDER_BINS_4X, (void *)prof_bins4);
+    }
 }
 
 static void split_setup(void)
 {
+    /* With 3D bin work-stealing enabled, 2 threads (1 on core 1 + idle-fill w0 on core 0) beat 3
+     * by avoiding core-1 context-switching and L1/L2 thrashing between two 144 KB render targets. */
+    const char *env_b = getenv("DSFAST_BATCH3D");
+    if (steal3d_on)
+        batch3d_max = 2;
+    if (env_b && env_b[0] >= '1' && env_b[0] <= '4' && !env_b[1])
+        batch3d_max = (u32)(env_b[0] - '0');
     split_tramp[0] = *(u32 *)FN_VIDEO_3D_FINISH_RENDERING;        /* strd r4, r5, [sp, #-24]! */
     split_tramp[1] = *(u32 *)(FN_VIDEO_3D_FINISH_RENDERING + 4);  /* movw r4, #0x93b8 */
     split_tramp[2] = 0xe51ff004;
@@ -1090,6 +1222,74 @@ static void split_setup(void)
     flush_icache(split_tramp, split_tramp + 4);
     patch(FN_VIDEO_3D_FINISH_RENDERING, (void *)split_finish_rendering);
 }
+
+__asm__(
+    ".syntax unified\n"
+    ".arch armv7-a\n"
+    ".arm\n"
+    ".text\n"
+    ".global dsfast_engine_b_tramp\n"
+    ".hidden dsfast_engine_b_tramp\n"
+    ".type dsfast_engine_b_tramp, %function\n"
+    ".p2align 4\n"
+"dsfast_engine_b_tramp:\n"
+    "ldr     r0, [sp, #8]\n"
+    "bl      dsfast_should_skip_eb\n"
+    "cmp     r0, #0\n"
+    "beq     .Leb_orig\n"
+    "ldr     r9, [sp, #8]\n"
+    "movw    r3, #44096\n"
+    "movt    r3, #67\n"
+    "mov     r1, #0\n"
+    "mov     r2, #191\n"
+    "add     r0, r9, #7616\n"
+    "add     r3, r9, r3\n"
+    "ldr     ip, .Leb_render2d\n"
+    "blx     ip\n"
+    "mov     r0, r9\n"
+    "bl      dsfast_eb_events_only\n"
+    "ldr     pc, .Leb_epilogue\n"
+".Leb_orig:\n"
+    "ldr     r9, [sp, #8]\n"
+    "movw    r8, #44184\n"
+    "ldr     pc, .Leb_ret\n"
+    ".align 2\n"
+".Leb_render2d:\n"
+    ".word   0x0804f480\n"
+".Leb_epilogue:\n"
+    ".word   0x08035ed0\n"
+".Leb_ret:\n"
+    ".word   0x08035fb4\n"
+    ".size dsfast_engine_b_tramp, .-dsfast_engine_b_tramp\n"
+
+    ".data\n"
+    ".align 4\n"
+    ".global dsfast_next_bin\n"
+    ".hidden dsfast_next_bin\n"
+"dsfast_next_bin:\n"
+    ".word   0\n"
+
+    ".text\n"
+    ".align 4\n"
+    ".global dsfast_prep_bins_4x\n"
+    ".hidden dsfast_prep_bins_4x\n"
+    ".type dsfast_prep_bins_4x, %function\n"
+"dsfast_prep_bins_4x:\n"
+    "ldr     r3, .Lnext_bin_off\n"
+".Lpic_next_bin:\n"
+    "add     r3, pc, r3\n"
+    "mov     r2, #0\n"
+    "str     r2, [r3]\n"
+    "dmb     ish\n"
+    "ldr     r3, [r4, #4]\n"
+    "add     r2, r5, #0x1bc000\n"
+    "ldr     pc, .Lprep_ret\n"
+".Lnext_bin_off:\n"
+    ".word   dsfast_next_bin - (.Lpic_next_bin + 8)\n"
+".Lprep_ret:\n"
+    ".word   0x080785b4\n"
+    ".size dsfast_prep_bins_4x, .-dsfast_prep_bins_4x\n"
+);
 
 __attribute__((constructor)) static void dsfast_init(void)
 {
@@ -1107,6 +1307,13 @@ __attribute__((constructor)) static void dsfast_init(void)
         return;
     active = 1;
     set_core(CORE0);   /* the emulation; threads it creates are placed in pthread_create */
+    {
+        const char *no_nice = getenv("DSFAST_NO_NICE");
+        if (no_nice && no_nice[0] == '1')
+            use_nice = 0;
+        if (use_nice)
+            sys3(97, 0, 0, -5); /* setpriority: keep Core 0 priority above w0 3D helper (nice 0/+5) */
+    }
     if (*(u32 *)FN_GET_TICKS_US == 0xe16d40fcu)
         patch(FN_GET_TICKS_US, (void *)dsfast_get_ticks_us);
     patch(FN_SYSTEM_FRAME_SYNC, (void *)dsfast_system_frame_sync);
@@ -1116,6 +1323,7 @@ __attribute__((constructor)) static void dsfast_init(void)
         start_sec = ts.tv_sec;
     }
     hide_setup();
+    steal3d_setup();
     split_setup();
     prof_setup();
     blur_setup();
