@@ -953,6 +953,20 @@ int dsfast_should_skip_eb(const u8 *video)
     return *(void *const *)(video + 0x82d30 + 0x1c) == *(void *const *)(DS_SCREENS + 28 * hidden + 4);
 }
 
+/* Called by dsfast_engine_b_tramp after skipping hidden Engine B: run video_2d_render_scanlines on it
+   with screen_ptr (v2d +0x1c) cleared, as DraStic does for a skipped frame, so its event queue (deferred
+   palette, OAM and 2D register writes of this frame) still reaches palette_ram / the engine state but
+   nothing is drawn. A POWCNT1 event in the queue may set a new screen_ptr: keep that one. */
+void dsfast_eb_events_only(u8 *video)
+{
+    u8 *v2d = video + 0x82d30;
+    void *saved = *(void **)(v2d + 0x1c);
+    *(void **)(v2d + 0x1c) = 0;
+    ((void (*)(u8 *, u32, u32, void *))0x0804f480u)(v2d, 0, 191, 0);
+    if (!*(void **)(v2d + 0x1c))
+        *(void **)(v2d + 0x1c) = saved;
+}
+
 static void neon3d_setup(void)
 {
     static const struct { u32 addr; u32 insn; void (*fn)(void); } k[] = {

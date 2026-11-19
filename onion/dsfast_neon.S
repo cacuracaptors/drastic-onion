@@ -748,7 +748,10 @@ dsfast_edge_identify_4x:
 
 /* Patch target at 0x08035fac inside video_render_scanlines:
  * When Engine B is hidden, skips waking video_render_thread (no mutex / cond_signal / cond_wait)
- * and only renders Engine A before jumping to video_render_scanlines epilogue at 0x08035ed0. */
+ * and renders Engine A, then lets dsfast_eb_events_only() apply Engine B's queued 2D events
+ * (deferred palette/OAM/register writes) without drawing, before jumping to the
+ * video_render_scanlines epilogue at 0x08035ed0. Without that step Engine B's deferred palette
+ * writes made while it is hidden are dropped at start_frame (GTA CTW hot-wire dashboard colours). */
     .global dsfast_engine_b_tramp
     .type dsfast_engine_b_tramp, %function
     .p2align 4
@@ -766,6 +769,8 @@ dsfast_engine_b_tramp:
     add     r3, r9, r3
     ldr     ip, =0x0804f480         /* video_2d_render_scanlines */
     blx     ip
+    mov     r0, r9                  /* video (r9 is callee-saved) */
+    bl      dsfast_eb_events_only
     ldr     pc, =0x08035ed0         /* video->scanlines_rendered = 0xbf + 1 */
 .Leb_orig:
     ldr     r9, [sp, #8]
