@@ -89,6 +89,11 @@
  *
  * 17. DSFAST_PROF=1: per-frame timing of the 2D, the 3D and the waits in dsfast.log, for studies.
  *
+ * 18. 30-fps pair pacing (DSFAST_NO_PAIR30=1 to disable): 30-fps games (e.g. GTA) alternate a light frame
+ *     (<12 ms) and a heavy 3D frame (>18 ms). Instead of sleeping ~10 ms after the light frame and then
+ *     missing the 33.52 ms pair deadline on the heavy frame, allow up to 1 refresh of slack after light
+ *     frames once the alternating cadence is detected (hysteresis score >= 6).
+ *
  * All act only inside the drastic executable (programs it starts inherit LD_PRELOAD). */
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -289,14 +294,32 @@ static void wait_us(u32 us)
     while (t - t0 < (s64)us);
 }
 
-static void frame_sync(void *sys)
+static s64 prev_work_us;
+static u32 pair30_score;
+static int no_pair30;
+
+static void frame_sync(void *sys, s64 work_us)
 {
     s64 *target = (s64 *)((char *)sys + 0x2aeae50);
     void *audio = (char *)sys + 0x1566000;
     u32 skip_type, skip_value, interval, astate;
     s32 delta;
-    int late;
+    int late, is_30fps;
     s64 t, now, tgt;
+
+    if (work_us > 0 && work_us < 150000) {
+        if ((work_us < 12000 && prev_work_us > 18000) || (work_us > 18000 && prev_work_us < 12000)) {
+            if (pair30_score < 16)
+                pair30_score += 2;
+        } else if (pair30_score > 0) {
+            pair30_score--;
+        }
+        prev_work_us = work_us;
+    } else {
+        pair30_score = 0;
+        prev_work_us = 0;
+    }
+    is_30fps = !no_pair30 && (pair30_score >= 6);
 
     interval = CFG(sys, FRAME_INTERVAL);
     astate = audio_buffer_state(audio);
@@ -357,9 +380,17 @@ timer:
         *target = now;
         delta = 0;
     }
-    if (delta > 0)
-        wait_us((u32)delta / 3);
-    else if (delta < -18000)   /* 6 ms late (DraStic: 3 ms), see section 12 */
+    if (delta > 0) {
+        if (is_30fps && work_us > 0 && work_us < 12000) {
+            /* 30 fps games (e.g. GTA) alternate a ~6 ms light frame and a ~27 ms 3D frame:
+             * lend up to 1 refresh of slack from the light frame so the heavy frame starts
+             * immediately instead of sleeping ~10 ms and missing the 33.52 ms pair deadline. */
+            if (delta > (s32)interval)
+                wait_us((u32)(delta - (s32)interval) / 3);
+        } else {
+            wait_us((u32)delta / 3);
+        }
+    } else if (delta < -18000)   /* 6 ms late (DraStic: 3 ms), see section 12 */
         late = 1;
     goto frameskip;
 
@@ -437,17 +468,18 @@ static void count_work(u32 w)
 void dsfast_system_frame_sync(void *sys)
 {
     s64 t = mono_us();
-    g_sys = sys;
+    s64 work_us = sync_end_us ? (t - sync_end_us) : 0;
     int counted = sync_end_us && t - sync_end_us < 200000;   /* not after a menu or a load */
+    g_sys = sys;
     copy_setup_late();
     if (counted)
-        count_work((u32)(t - sync_end_us));
+        count_work((u32)work_us);
     frame_ready();
-    frame_sync(sys);
+    frame_sync(sys, work_us);
     if (F(sys, SKIP_NEXT))
         undrawn_n++;
     if (prof_on)
-        prof_frame((u32)(t - sync_end_us), counted, !F(sys, SKIP_NEXT));
+        prof_frame((u32)work_us, counted, !F(sys, SKIP_NEXT));
     sync_end_us = mono_us();
 }
 
@@ -1106,6 +1138,11 @@ __attribute__((constructor)) static void dsfast_init(void)
     if (*(u32 *)FN_SYSTEM_FRAME_SYNC != 0xe16d42f4u)
         return;
     active = 1;
+    {
+        const char *env_p = getenv("DSFAST_NO_PAIR30");
+        if (env_p && env_p[0] == '1')
+            no_pair30 = 1;
+    }
     set_core(CORE0);   /* the emulation; threads it creates are placed in pthread_create */
     if (*(u32 *)FN_GET_TICKS_US == 0xe16d40fcu)
         patch(FN_GET_TICKS_US, (void *)dsfast_get_ticks_us);
