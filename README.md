@@ -63,6 +63,10 @@ All details, with the measurements behind each one, are in the comments at the t
     and whenever the system time changed, which froze the game (fixed in Beta 2, reported and fixed by
     Kmieciu4ever).
 14. **Blur remembered**: the Blur/Pixel choice of the screen (MENU+B) is kept between sessions (Beta 3).
+15. **Menu settings remembered**: the CPU clock chosen in the menu (MENU+START) and the screen the stylus is on
+    are kept between sessions (Beta 4).
+16. **Screen copy off the emulation**: the copy of each finished frame for the video thread runs on the second
+    core, so the emulation goes on at once: fewer stutters (Beta 4).
 
 The launcher (`launch.sh`) also:
 - sets the CPU clock by model: 1800 MHz on the Mini Plus, 1600 MHz on the Mini v2/v3/v4 and Flip, and puts it back

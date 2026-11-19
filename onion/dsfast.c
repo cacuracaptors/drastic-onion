@@ -41,7 +41,8 @@
  *    99.20 -> 99.44%, Zelda Phantom Hourglass 99.41 -> 99.76%, GTA Chinatown Wars 98.3-98.6 -> 98.93%.
  *
  * 8. The hidden screen is not drawn. In the SDL layer's single-screen layouts (S0/S1 show only DraStic's
- *    screen 1; the high-res 3D mode shows only screen 0) the other screen was drawn line by line for nothing.
+ *    screen 1) the other screen was drawn line by line for nothing. (Beta 4: never in the high-resolution 3D
+ *    mode, where skipping a screen drew garbage on both.)
  *    render_scanline, the only per-line drawing call, now skips the 2D engine whose output is the hidden
  *    screen (compared by pointer, so it works whichever screen the player put where), unless that engine is
  *    doing a display capture, which the game reads back. Register events and the rest of the line loop
@@ -77,6 +78,16 @@
  *
  * 14. (Beta 3) The SDL layer's Blur/Pixel choice (MENU+B) is remembered between sessions, and dsfast.log (next to
  *     launch.sh) gets a short summary on exit (screen mode, flip mode, panel refresh, frames per second).
+ *
+ * 15. (Beta 4) Settings of the SDL menu (MENU+START) that it never saved are kept: the CPU clock and the screen the
+ *     stylus is on (config/.dsfast_cpuclock and .dsfast_touchpad, applied by launch.sh).
+ *
+ * 16. (Beta 4) The copy of the screens for the SDL video thread (sdl_update_screen: cache flush, 2D accelerator
+ *     copy and its wait) runs on core 1 instead of the emulation thread (see section 16). Recorded Mario Kart DS
+ *     race, 640x480, 1800 MHz: frames over 33 ms 10 -> 2-3, p99.9 29 -> 18-19 ms, frames skipped 14 -> 3-6,
+ *     frames 2 or more refreshes on screen 20 -> 6-9 (average emulation time per frame 8.4 -> 9.0-9.2 ms).
+ *
+ * 17. DSFAST_PROF=1: per-frame timing of the 2D, the 3D and the waits in dsfast.log, for studies.
  *
  * All act only inside the drastic executable (programs it starts inherit LD_PRELOAD). */
 typedef unsigned char u8;
@@ -116,8 +127,10 @@ static long futex(volatile int *addr, int op, int val, struct timespec *ts)
     return r0;
 }
 static volatile s64 last_frame_us;
+static u32 frames_n;
 static void frame_ready(void)
 {
+    frames_n++;
     last_frame_us = mono_us();
     __sync_fetch_and_add(&frame_seq, 1);
     futex(&frame_seq, 1 | 128, 0x7fffffff, 0);   /* FUTEX_WAKE_PRIVATE */
@@ -403,10 +416,18 @@ frameskip:
 static void *g_sys;
 /* diagnostics for dsfast.log (section 14): emulation time per frame, frames not drawn */
 static s64 sync_end_us;
-static u32 work_n, work_sum10, work_max, work_hist[5], undrawn_n;
+static u32 work_n, work_sum10, work_max, work_hist[5], undrawn_n, work_ms[64];
+static void copy_setup_late(void);    /* section 16 */
+static int copy_mode;
+static u32 us_async, us_sync, us_main_sum10, us_main_max, copy_waits, copy_wait_us;
+static int prof_on;                   /* section 17 */
+static u32 pf_2d, pf_wait3d, pf_lines;
+static u32 pd[2][6], pd_hist[2][64];
+static void prof_frame(u32 w, int counted, int drawn_next);
 static void count_work(u32 w)
 {
     work_n++;
+    work_ms[w / 1000 < 63 ? w / 1000 : 63]++;
     work_sum10 += w / 10;
     if (w > work_max)
         work_max = w;
@@ -417,12 +438,16 @@ void dsfast_system_frame_sync(void *sys)
 {
     s64 t = mono_us();
     g_sys = sys;
-    if (sync_end_us && t - sync_end_us < 200000)   /* not after a menu or a load */
+    int counted = sync_end_us && t - sync_end_us < 200000;   /* not after a menu or a load */
+    copy_setup_late();
+    if (counted)
         count_work((u32)(t - sync_end_us));
     frame_ready();
     frame_sync(sys);
     if (F(sys, SKIP_NEXT))
         undrawn_n++;
+    if (prof_on)
+        prof_frame((u32)(t - sync_end_us), counted, !F(sys, SKIP_NEXT));
     sync_end_us = mono_us();
 }
 
@@ -605,6 +630,33 @@ static u32 cpu_mhz(void)
 }
 static u32 mhz_start;
 
+/* Settings of the SDL layer's menu that it does not save itself (section 15): the CPU clock chosen in its menu
+   (set in the chip, read back here) and the screen the stylus is on (nds.pen.pos, MENU+UP/DOWN in stylus mode;
+   read from settings.json at start, never written back). launch.sh applies the two files at the next start. */
+#define CPU_FILE "config/.dsfast_cpuclock"
+#define TOUCH_FILE "config/.dsfast_touchpad"
+static int *sdl_nds;             /* libSDL2 v1.8 'nds' struct (section 8) */
+static void settings_save(void)
+{
+    u32 now = cpu_mhz();
+    if (mhz_start && now >= 400 && now <= 2400 && (now > mhz_start + 25 || now + 25 < mhz_start)) {
+        void *f = log_fopen(CPU_FILE, "w");
+        if (f) {
+            log_printf(f, "%u\n", (now + 25) / 50 * 50);   /* the menu moves in steps of 50 MHz */
+            log_fclose(f);
+        }
+    }
+    /* nds.pen.xv at +0x6f4 holds the X speed (between 10000 and 300000 in the menu): sanity check of the offsets */
+    if (sdl_nds && sdl_nds[0x6f4 / 4] >= 1000 && sdl_nds[0x6f4 / 4] <= 1000000 &&
+        (sdl_nds[0x704 / 4] == 0 || sdl_nds[0x704 / 4] == 1)) {
+        void *f = log_fopen(TOUCH_FILE, "w");
+        if (f) {
+            log_printf(f, "%d\n", sdl_nds[0x704 / 4]);
+            log_fclose(f);
+        }
+    }
+}
+
 static void write_log(void)
 {
     void *f = log_fopen("dsfast.log", "w");
@@ -614,12 +666,12 @@ static void write_log(void)
         return;
     clock_gettime(1, &ts);
     secs = (u32)(ts.tv_sec - start_sec);
-    fps10 = secs ? (u32)frame_seq * 10 / secs : 0;
-    log_printf(f, "libdsfast beta3\n");
+    fps10 = secs ? frames_n * 10 / secs : 0;
+    log_printf(f, "libdsfast beta4\n");
     log_printf(f, "screen: %ux%u, pages: %s\n", flip_xres, page_h, flip_state == 1 ? "3 (flip without blocking)" :
             flip_state == -1 ? "2 (plain flip)" : "not set up");
     log_printf(f, "panel refresh: %u.%02u Hz (%u vsyncs measured)\n", hz100 / 100, hz100 % 100, vsync_n);
-    log_printf(f, "time: %u s, frames emulated: %u (%u.%u per s), screen flips: %u\n", secs, (u32)frame_seq,
+    log_printf(f, "time: %u s, frames emulated: %u (%u.%u per s), screen flips: %u\n", secs, frames_n,
             fps10 / 10, fps10 % 10, flip_n);
     log_printf(f, "flips that waited for the previous one: %u (%u ms in all)\n", flip_waits, flip_wait_us / 1000);
     log_printf(f, "blur: %s\n", !sdl_down_scale ? "unknown" : *sdl_down_scale ? "off (Pixel)" : "on");
@@ -639,7 +691,43 @@ static void write_log(void)
         log_printf(f, "frames by emulation time: <12 ms %u, 12-16.7 ms %u, 16.7-20 ms %u, 20-33 ms %u, >33 ms %u\n",
                    work_hist[0], work_hist[1], work_hist[2], work_hist[3], work_hist[4]);
     }
+    if (work_n) {
+        /* percentiles from the 1 ms histogram: the frame time that p% of the frames stay under */
+        static const u32 pc[4] = { 500, 900, 990, 999 };   /* per mille */
+        u32 v[4], i, k, acc;
+        for (i = 0; i < 4; i++) {
+            u32 need = work_n / 1000 * pc[i] + work_n % 1000 * pc[i] / 1000;
+            for (k = 0, acc = 0; k < 63 && acc + work_ms[k] < need; k++)
+                acc += work_ms[k];
+            v[i] = k + 1;
+        }
+        log_printf(f, "emulation per frame, percentiles (ms, upper bound): p50 %u, p90 %u, p99 %u, p99.9 %u\n",
+                   v[0], v[1], v[2], v[3]);
+    }
+    log_printf(f, "screen copy (sdl_update_screen): %s, on core 1 %u, on the emulation thread %u\n",
+               copy_mode == 1 ? "on core 1" : copy_mode == 2 ? "kept on the emulation thread" : "not hooked",
+               us_async, us_sync);
+    if (us_async + us_sync)
+        log_printf(f, "  time on the emulation thread: average %u us, worst %u us; waits for the copy: %u (%u ms)\n",
+                   us_main_sum10 / (us_async + us_sync) * 10, us_main_max, copy_waits, copy_wait_us / 1000);
     log_printf(f, "frames not drawn (frameskip): %u\n", undrawn_n);
+    if (prof_on) {
+        int k;
+        for (k = 1; k >= 0; k--) {
+            u32 *p = pd[k], n = p[0] ? p[0] : 1, i, acc, v[3];
+            static const u32 pc[3] = { 500, 900, 990 };
+            for (i = 0; i < 3; i++) {
+                u32 need = p[0] / 1000 * pc[i] + p[0] % 1000 * pc[i] / 1000, j;
+                for (j = 0, acc = 0; j < 63 && acc + pd_hist[k][j] < need; j++)
+                    acc += pd_hist[k][j];
+                v[i] = j + 1;
+            }
+            log_printf(f, "PROF frames %s: %u, per frame (ms x10): emulation %u (p50 %u p90 %u p99 %u ms), 2D lines %u "
+                       "(%u lines), waits for 3D %u, 3D work all threads %u\n", k ? "drawn" : "skipped", p[0],
+                       p[1] / n * 10 / 100, v[0], v[1], v[2], p[2] / n * 10 / 100, p[5] / n, p[3] / n * 10 / 100,
+                       p[4] / n * 10 / 100);
+        }
+    }
     log_printf(f, "time between screen flips: <14 ms %u, 1 refresh %u, 2 refreshes %u, more %u\n",
                flip_hist[0], flip_hist[1], flip_hist[2], flip_hist[3]);
     log_fclose(f);
@@ -657,6 +745,7 @@ __attribute__((destructor)) static void dsfast_end(void)
         } else
             unlink(BLUR_FILE);
     }
+    settings_save();
     write_log();
     if (flip_state != 1)
         return;
@@ -741,6 +830,91 @@ int pthread_create(unsigned long *th, void *attr, void *(*fn)(void *), void *arg
     return real(th, attr, tramp_run, t);
 }
 
+/* ------------------------------------------------------------------ 16. screen copy off the emulation thread
+   The SDL layer's sdl_update_screen (DraStic's update_screen, detoured to it) runs on the emulation thread at
+   the end of every frame: it flushes the CPU cache of DraStic's two screens, has the 2D accelerator copy them
+   to the buffer its video thread reads, and waits for the copy. Here a thread on core 1 makes that call; the
+   emulation goes on at once and waits for the copy only if it starts drawing the next frame (render_scanline)
+   or ends it before the copy is done. Not in high resolution (512x384) nor while a menu is open (no frame for
+   100 ms): there the call stays where it was. DSFAST_SYNCCOPY=1 keeps it there always (for comparisons). */
+#define SDL_UPDATE_SCREEN 0xe7490u          /* sdl_update_screen in libSDL2 v1.8, from SDL_Init at 0x35470 */
+#define FN_UPDATE_SCREEN 0x080a83c0u        /* DraStic's update_screen: ldr pc, [pc, #-4] + address (detour) */
+static u8 *sdl_base;
+static void (*orig_update_screen)(void);
+static volatile int copy_busy;
+static int copy_mode;                        /* 0 not set up, 1 on core 1, 2 kept on the emulation thread */
+static u32 us_async, us_sync, us_main_sum10, us_main_max, copy_waits, copy_wait_us;
+static void copy_wait(void)
+{
+    s64 t;
+    if (!copy_busy)
+        return;
+    t = mono_us();
+    while (copy_busy)
+        futex(&copy_busy, 0 | 128, 1, 0);   /* FUTEX_WAIT_PRIVATE while 1 */
+    copy_waits++;
+    copy_wait_us += (u32)(mono_us() - t);
+}
+static void *copy_thread(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        while (!copy_busy)
+            futex(&copy_busy, 0 | 128, 0, 0);
+        orig_update_screen();
+        __sync_synchronize();
+        copy_busy = 0;
+        futex(&copy_busy, 1 | 128, 0x7fffffff, 0);
+        /* the SDL video thread may have looked before the copy was done: wake it again (section 3) */
+        __sync_fetch_and_add(&frame_seq, 1);
+        futex(&frame_seq, 1 | 128, 0x7fffffff, 0);
+    }
+    return 0;
+}
+static void dsfast_update_screen(void)
+{
+    static u32 calls;
+    s64 t0 = mono_us();
+    u32 d;
+    calls++;
+    copy_wait();                             /* the previous copy, if it is still going */
+    /* the first 30 calls draw directly in the SDL layer (its prepare_time) */
+    static int hires_ok = -1;
+    if (hires_ok < 0)
+        hires_ok = getenv("DSFAST_HIRESCOPY") != 0;   /* test: also in high resolution */
+    if (copy_mode == 1 && calls > 40 && (hires_ok || (!*(u8 *)(0x0aee952cu + 0x19) && !*(u8 *)(0x0aee952cu + 28 + 0x19))) &&
+        t0 - last_frame_us < 100000) {
+        static int started;
+        if (!started) {
+            unsigned long th;
+            started = 1;
+            pthread_create(&th, 0, copy_thread, 0);   /* placed on core 1 by pthread_create below */
+        }
+        copy_busy = 1;
+        futex(&copy_busy, 1 | 128, 1, 0);
+        us_async++;
+    } else {
+        orig_update_screen();
+        us_sync++;
+    }
+    d = (u32)(mono_us() - t0);
+    us_main_sum10 += d / 10;
+    if (d > us_main_max)
+        us_main_max = d;
+}
+/* called every frame until the SDL layer has detoured update_screen */
+static void copy_setup_late(void)
+{
+    u32 *p = (u32 *)FN_UPDATE_SCREEN;
+    if (copy_mode || !sdl_base || p[0] != 0xe51ff004u || p[1] != (u32)(sdl_base + SDL_UPDATE_SCREEN))
+        return;
+    orig_update_screen = (void (*)(void))(void *)p[1];
+    copy_mode = getenv("DSFAST_SYNCCOPY") ? 2 : 1;
+    mprotect((void *)(FN_UPDATE_SCREEN & ~4095u), 8192, 7);
+    p[1] = (u32)dsfast_update_screen;
+    flush_icache(p, p + 2);
+}
+
 /* ------------------------------------------------------------------ 8. hidden screen */
 
 #define FN_RENDER_SCANLINE 0x0804c9f0u
@@ -750,15 +924,20 @@ static u32 hide_tramp[4] __attribute__((aligned(16)));   /* render_scanline's fi
 static u8 *volatile hide_a, *volatile hide_a_cap;   /* engine A (the one with 3D) and its capture settings */
 static int hidden_screen(void)
 {
-    if (*(u8 *)(DS_SCREENS + 0x19))
-        return 1;
+    /* high-resolution 3D (hires_3d = 1, either screen at 512x384): DraStic composes the screens its own way and
+       skipping one drew garbage on both, so nothing is skipped then */
+    if (*(u8 *)(DS_SCREENS + 0x19) || *(u8 *)(DS_SCREENS + 28 + 0x19))
+        return -1;
     if (sdl_nds[4] == 2 || sdl_nds[4] == 3)           /* NDS_DIS_MODE_S0 / S1 */
         return 0;
     return -1;
 }
 static void hide_render_scanline(u8 *v2d, u8 *dst, u32 line, u8 *cap)
 {
-    int hidden = hidden_screen();
+    int hidden;
+    if (copy_busy)                     /* 16. the copy of the last frame still reads the screens */
+        copy_wait();
+    hidden = hidden_screen();
     if (!v2d[0x97]) {
         hide_a = v2d;
         hide_a_cap = cap;
@@ -766,6 +945,13 @@ static void hide_render_scanline(u8 *v2d, u8 *dst, u32 line, u8 *cap)
     /* v2d +0x1c: this engine's output; cap: capture settings (engine A only), +0x2d capture on */
     if (hidden >= 0 && *(void **)(v2d + 0x1c) == *(void **)(DS_SCREENS + 28 * hidden + 4) && !(cap && cap[0x2d]))
         return;
+    if (prof_on) {
+        s64 t = mono_us();
+        ((void (*)(u8 *, u8 *, u32, u8 *))(void *)hide_tramp)(v2d, dst, line, cap);
+        pf_2d += (u32)(mono_us() - t);
+        pf_lines++;
+        return;
+    }
     ((void (*)(u8 *, u8 *, u32, u8 *))(void *)hide_tramp)(v2d, dst, line, cap);
 }
 /* The 3D of a frame is not started (video_3d_start_rendering, threaded 3D) while engine A has been on the
@@ -799,6 +985,8 @@ static void split_finish_rendering(void *v3d)
     s64 t0 = mono_us();
     u32 h, c, x;
     ((void (*)(void *))(void *)split_tramp)(v3d);
+    if (prof_on)
+        pf_wait3d += (u32)(mono_us() - t0);
     h = (split_hist << 1) | (mono_us() - t0 > 1000);
     split_hist = h;
     for (c = 0, x = h & 0xffff; x; x &= x - 1)
@@ -814,6 +1002,7 @@ static void hide_setup(void)
     if (!init || *(u32 *)(init - 0x35470 + 0xe6178) != 0xe92d4ff0u)
         return;
     sdl_nds = (int *)(init - 0x35470 + 0x16e4a0);
+    sdl_base = init - 0x35470;
     hide_tramp[0] = *(u32 *)FN_RENDER_SCANLINE;         /* strd r4, r5, [sp, #-36]! */
     hide_tramp[1] = *(u32 *)(FN_RENDER_SCANLINE + 4);   /* movw r5, #0x2008 */
     hide_tramp[2] = 0xe51ff004;                          /* ldr pc, [pc, #-4] */
@@ -828,6 +1017,67 @@ static void hide_setup(void)
     mprotect((void *)((u32)hide3d_tramp & ~4095u), 8192, 7);
     flush_icache(hide3d_tramp, hide3d_tramp + 4);
     patch(FN_VIDEO_3D_START_RENDERING, (void *)hide3d_start_rendering);
+}
+
+/* ------------------------------------------------------------------ 17. where a frame's time goes (DSFAST_PROF=1)
+   For studies only (the timing itself costs a little): per frame, separately for frames drawn and skipped,
+   the time of the 2D lines (render_scanline, on the emulation thread), the emulation's waits for the 3D
+   (video_3d_finish_rendering) and the 3D work of all threads (video_3d_render_bins_1x/4x). In dsfast.log. */
+#define FN_RENDER_BINS_1X 0x08074338u
+#define FN_RENDER_BINS_4X 0x08077b80u
+static int prof_on;
+static u32 pf_2d, pf_wait3d, pf_lines;
+static volatile u32 pf_3d;
+static u32 pd[2][6], pd_hist[2][64];        /* [skipped, drawn]: n, work, 2d, wait3d, 3d, lines */
+static int prof_drawn = 1;
+static u32 bins1_tramp[4] __attribute__((aligned(16))), bins4_tramp[4] __attribute__((aligned(16)));
+static void prof_bins1(void *a)
+{
+    s64 t = mono_us();
+    ((void (*)(void *))(void *)bins1_tramp)(a);
+    __sync_fetch_and_add(&pf_3d, (u32)(mono_us() - t));
+}
+static void prof_bins4(void *a)
+{
+    s64 t = mono_us();
+    ((void (*)(void *))(void *)bins4_tramp)(a);
+    __sync_fetch_and_add(&pf_3d, (u32)(mono_us() - t));
+}
+/* end of a frame (from system_frame_sync): w = its emulation time, drawn_next = it will draw the next one */
+static void prof_frame(u32 w, int counted, int drawn_next)
+{
+    u32 *p = pd[prof_drawn], d3 = __sync_lock_test_and_set(&pf_3d, 0);
+    if (counted) {
+        p[0]++;
+        p[1] += w / 10;
+        p[2] += pf_2d / 10;
+        p[3] += pf_wait3d / 10;
+        p[4] += d3 / 10;
+        p[5] += pf_lines;
+        pd_hist[prof_drawn][w / 1000 < 63 ? w / 1000 : 63]++;
+    }
+    pf_2d = pf_wait3d = pf_lines = 0;
+    prof_drawn = drawn_next;
+}
+static void prof_setup(void)
+{
+    if (!getenv("DSFAST_PROF"))
+        return;
+    prof_on = 1;
+    bins1_tramp[0] = *(u32 *)FN_RENDER_BINS_1X;          /* add r3, r0, #0x24000 */
+    bins1_tramp[1] = *(u32 *)(FN_RENDER_BINS_1X + 4);    /* strd r4, r5, [sp, #-36]! */
+    bins1_tramp[2] = 0xe51ff004;
+    bins1_tramp[3] = FN_RENDER_BINS_1X + 8;
+    bins4_tramp[0] = *(u32 *)FN_RENDER_BINS_4X;
+    bins4_tramp[1] = *(u32 *)(FN_RENDER_BINS_4X + 4);
+    bins4_tramp[2] = 0xe51ff004;
+    bins4_tramp[3] = FN_RENDER_BINS_4X + 8;
+    mprotect((void *)((u32)bins1_tramp & ~4095u), 8192, 7);
+    mprotect((void *)((u32)bins4_tramp & ~4095u), 8192, 7);
+    flush_icache(bins1_tramp, bins1_tramp + 4);
+    flush_icache(bins4_tramp, bins4_tramp + 4);
+    patch(FN_RENDER_BINS_1X, (void *)prof_bins1);
+    patch(FN_RENDER_BINS_4X, (void *)prof_bins4);
 }
 
 static void split_setup(void)
@@ -867,6 +1117,7 @@ __attribute__((constructor)) static void dsfast_init(void)
     }
     hide_setup();
     split_setup();
+    prof_setup();
     blur_setup();
     mhz_start = cpu_mhz();
 }

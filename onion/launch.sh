@@ -78,10 +78,29 @@ if [ -f $cfg ] && [ ! -f config/.dsfast_defaults ]; then
         touch config/.dsfast_defaults
 fi
 
+# Settings of the SDL menu that it does not save itself, kept by libdsfast when DraStic exits: the screen the
+# stylus is on ("touchpad" in settings.json is read at start but never written back) and the CPU clock below.
+settings=resources/settings.json
+tp=$(cat config/.dsfast_touchpad 2> /dev/null)
+case "$tp" in
+    0 | 1) sed -i "s/\"touchpad\":[0-9]*/\"touchpad\":$tp/" $settings ;;
+esac
+
 orig_gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2> /dev/null)
 if [ "$CUST_CPUCLOCK" == "1" ]; then
     # Mini Plus (354) runs at 1800 MHz; Mini v2/v3/v4 (283) and Flip (285): 1600.
-    if [ "$(cat /tmp/deviceModel 2> /dev/null)" = "354" ]; then mhz=1800; else mhz=1600; fi
+    if [ "$(cat /tmp/deviceModel 2> /dev/null)" = "354" ]; then
+        mhz=1800
+        # the menu's CPU option stops at maxcpu (1600 in Onion's settings.json): let it reach 1800 here
+        sed -i 's/"maxcpu":1[0-7][0-9][0-9],/"maxcpu":1800,/' $settings
+    else
+        mhz=1600
+    fi
+    # the clock chosen in the menu (CPU), kept by libdsfast in config/.dsfast_cpuclock
+    saved=$(cat config/.dsfast_cpuclock 2> /dev/null)
+    case "$saved" in
+        [4-9][05]0 | 1[0-9][05]0 | 2[0-3][05]0) mhz=$saved ;;
+    esac
     cpuclock $mhz
 fi
 
