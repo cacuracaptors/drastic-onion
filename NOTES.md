@@ -9,7 +9,7 @@
   - **PR #2:** `pr-restore-cpuclock-on-exit` (`d8b2db2d`) — restore `cpuclock 1200` + `orig_gov` in `onion/launch.sh` (`trap EXIT INT TERM`).
 - **Review wanted:** `c7e1d2d2` — check `dsfast_render_bins_4x` / `dsfast_prep_bins_4x` (3D 4x bin work-stealing + `bin_interleave=12` trick) and `tramp_run()` child nice hierarchy (`flip -8 > Main -5 == Engine B -5 > w0 +5`).
 - **Device state (`192.168.0.246`, `mlock` FREE, `"vol": 8`, `"mute": 0`):**
-  - `/mnt/SDCARD/Emu/NDS/libs/libdsfast.so`: **Tier 3c #5 (`pair30`) + 44.1 kHz audio rate-control (`80 ms` pause reset) deployed** (`23036 B`, `MD5 a6c07118d89061717af39de88252a1a1`).
+  - `/mnt/SDCARD/Emu/NDS/libs/libdsfast.so`: **Merged `Beta 3.1` + Tier 3c #1/#5 (`pair30`) + 44.1 kHz audio rate-control (`80 ms` pause reset) deployed** (`28416 B`, `MD5 8c1d5992d3084ebf99b4ec4bcd99c485`).
   - `/mnt/SDCARD/Emu/NDS/libs/libasound.so.2`: **`44.1 kHz MI_AO` (`SAMPLES=8192`) with `mute_mi_ao()`, 1 silent warmup frame + unconditional `set_volume_raw()` around `MI_AO_Enable/Disable` deployed** (`19532 B`, `MD5 c8f900e90ce983cc1ddc805e1c59b462`).
   - `/mnt/SDCARD/Emu/NDS/libs/libSDL2-2.0.so.0`: Tier 2 CMA ping-pong + async `MI_GFX`; `/mnt/SDCARD/Emu/NDS/launch.sh`: `stop_audioserver.sh` restored (`4851 B`, `MD5 68ab2ec7bc3c0e4c2694e24b484b7939`).
   - `drastic.cfg`: `hires_3d = 1`, `frameskip_type = 2`, `frameskip_value = 2`, `threaded_3d = 1`, `screen_swap = 1` (32 bpp `ARGB8888`, `NDS_DIS_MODE_HRES1` 640x480).
