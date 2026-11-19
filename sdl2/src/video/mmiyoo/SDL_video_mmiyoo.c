@@ -75,8 +75,10 @@ int FB_SIZE = 0;
 int LINE_H = 0;
 int TMP_SIZE = 0;
 int DUP_SIZE = 0;
-/* Ping-pong cached CMA screen slots in gfx.dup for zero-copy high-res capture */
+/* Ping-pong cached CMA screen slots in gfx.dup for zero-copy 1x and 4x capture */
 static void *sdl_disp_ptr[2] = {NULL, NULL};
+static uintptr_t dup_base_keep = 0;
+static size_t dup_size_keep = 0;
 static pthread_mutex_t gfx_wait_mtx = PTHREAD_MUTEX_INITIALIZER;
 static int gfx_pending = 0;
 static int gfx_async_flip = 0;
@@ -84,6 +86,7 @@ static int gfx_want_async = 0;
 #if defined(MMIYOO) && !defined(UNITTEST)
 static MI_U16 gfx_pending_fence = 0;
 #endif
+void mmiyoo_gfx_wait(void);
 int FONT_SIZE = 0;
 int show_fps = 0;
 int down_scale = 1;
@@ -1499,6 +1502,7 @@ static int process_screen(void)
     nds.screen.init = *((uint32_t *)VAR_SDL_SCREEN_NEED_INIT);
 
     if (need_reload_bg) {
+        mmiyoo_gfx_wait();
         reload_bg();
         need_reload_bg -= 1;
     }
@@ -1741,7 +1745,6 @@ static int process_screen(void)
             gfx_want_async = (nds.menu.enable == 0) &&
                 (nds.dis_mode != NDS_DIS_MODE_VH_T0) &&
                 (nds.dis_mode != NDS_DIS_MODE_VH_T1) &&
-                (nds.overlay.sel >= nds.overlay.max) &&
                 (show_info_cnt == 0) &&
                 !(show_fps && fps_info);
 #endif
@@ -1831,12 +1834,17 @@ __attribute__((visibility("default"))) void mmiyoo_set_async_gfx(int enable)
     gfx_async_flip = enable;
 }
 
+static inline int is_dup_ptr(const void *ptr)
+{
+    uintptr_t p = (uintptr_t)ptr;
+
+    return dup_base_keep && (p >= dup_base_keep) && (p < (dup_base_keep + dup_size_keep));
+}
+
 /* Guard DraStic's free/realloc against touching our borrowed CMA ping-pong slots */
 static void sdl_free(void *ptr)
 {
-    uint8_t *base = (uint8_t *)gfx.dup.virAddr;
-
-    if (base && ((uint8_t *)ptr == base || (uint8_t *)ptr == base + (512 * 384 * 4))) {
+    if (is_dup_ptr(ptr)) {
         return;
     }
     free(ptr);
@@ -1844,9 +1852,7 @@ static void sdl_free(void *ptr)
 
 static void *sdl_realloc(void *ptr, size_t size)
 {
-    uint8_t *base = (uint8_t *)gfx.dup.virAddr;
-
-    if (base && ((uint8_t *)ptr == base || (uint8_t *)ptr == base + (512 * 384 * 4))) {
+    if (is_dup_ptr(ptr)) {
         return malloc(size);
     }
     return realloc(ptr, size);
@@ -1895,18 +1901,57 @@ void sdl_update_screen(void)
                 sdl_disp_ptr[0] = s0;
                 sdl_disp_ptr[1] = s0;
                 *pix_reg = (uint32_t)s1;
-                free(cur_p);
+                if (!is_dup_ptr(cur_p)) {
+                    free(cur_p);
+                }
             }
         }
-        else if (s0) {
-            if (p0) {
-                neon_memcpy(s0, p0, frame_bytes);
+        else if (s0 && (frame_bytes <= ((512u * 384u * 4u) / 2u))) {
+            /* Zero-copy CMA ping-pong for 1x dual screens: two 256x192 screens fit in each 768 KB half */
+            uint32_t *pix0_reg = (uint32_t *)VAR_SDL_SCREEN0_PIXELS;
+            uint32_t *pix1_reg = (uint32_t *)VAR_SDL_SCREEN1_PIXELS;
+            uint8_t *s0_0 = s0;
+            uint8_t *s0_1 = s0 + frame_bytes;
+            uint8_t *s1_0 = s1;
+            uint8_t *s1_1 = s1 + frame_bytes;
+
+            if ((p0 == s0_0) && (p1 == s0_1)) {
+                sdl_disp_ptr[0] = s0_0;
+                sdl_disp_ptr[1] = s0_1;
+                *pix0_reg = (uint32_t)s1_0;
+                *pix1_reg = (uint32_t)s1_1;
             }
-            if (p1) {
-                neon_memcpy(s0 + frame_bytes, p1, frame_bytes);
+            else if ((p0 == s1_0) && (p1 == s1_1)) {
+                sdl_disp_ptr[0] = s1_0;
+                sdl_disp_ptr[1] = s1_1;
+                *pix0_reg = (uint32_t)s0_0;
+                *pix1_reg = (uint32_t)s0_1;
             }
-            sdl_disp_ptr[0] = s0;
-            sdl_disp_ptr[1] = s0 + frame_bytes;
+            else {
+                int in_s0 = (((uint8_t *)p0 >= s0) && ((uint8_t *)p0 < s1)) ||
+                            (((uint8_t *)p1 >= s0) && ((uint8_t *)p1 < s1));
+                uint8_t *dst0 = in_s0 ? s1_0 : s0_0;
+                uint8_t *dst1 = in_s0 ? s1_1 : s0_1;
+                uint8_t *nxt0 = in_s0 ? s0_0 : s1_0;
+                uint8_t *nxt1 = in_s0 ? s0_1 : s1_1;
+
+                if (p0 && ((uint8_t *)p0 != dst0)) {
+                    neon_memcpy(dst0, p0, frame_bytes);
+                }
+                if (p1 && ((uint8_t *)p1 != dst1)) {
+                    neon_memcpy(dst1, p1, frame_bytes);
+                }
+                sdl_disp_ptr[0] = dst0;
+                sdl_disp_ptr[1] = dst1;
+                *pix0_reg = (uint32_t)nxt0;
+                *pix1_reg = (uint32_t)nxt1;
+                if (p0 && !is_dup_ptr(p0)) {
+                    free(p0);
+                }
+                if (p1 && (p1 != p0) && !is_dup_ptr(p1)) {
+                    free(p1);
+                }
+            }
         }
 #endif
         __sync_synchronize();
@@ -2923,6 +2968,8 @@ int fb_init(void)
 
     MI_SYS_MMA_Alloc(NULL, DUP_SIZE, &gfx.dup.phyAddr);
     MI_SYS_Mmap(gfx.dup.phyAddr, DUP_SIZE, &gfx.dup.virAddr, TRUE);
+    dup_base_keep = (uintptr_t)gfx.dup.virAddr;
+    dup_size_keep = (size_t)DUP_SIZE;
 
     MI_SYS_MMA_Alloc(NULL, TMP_SIZE, &gfx.tmp.phyAddr);
     MI_SYS_Mmap(gfx.tmp.phyAddr, TMP_SIZE, &gfx.tmp.virAddr, TRUE);
@@ -4393,9 +4440,8 @@ int GFX_Copy(const void *pixels, SDL_Rect srcrect, SDL_Rect dstrect, int pitch, 
         gfx.hw.opt.eDstDfbBldOp = E_MI_GFX_DFB_BLD_INVSRCALPHA;
         gfx.hw.opt.eDFBBlendFlag = E_MI_GFX_DFB_BLEND_SRC_PREMULTIPLY | E_MI_GFX_DFB_BLEND_COLORALPHA | E_MI_GFX_DFB_BLEND_ALPHACHANNEL;
         MI_GFX_BitBlit(&gfx.hw.overlay.surf, &gfx.hw.overlay.rt, &gfx.hw.dst.surf, &gfx.hw.dst.rt, &gfx.hw.opt, &u16Fence);
-        MI_GFX_WaitAllDone(FALSE, u16Fence);
     }
-    else if (gfx_async_flip && gfx_want_async) {
+    if (gfx_async_flip && gfx_want_async) {
         pthread_mutex_lock(&gfx_wait_mtx);
         gfx_pending_fence = u16Fence;
         gfx_pending = 1;
