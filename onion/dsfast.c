@@ -65,6 +65,19 @@
  *     repeated frames (slowdown) appear at 1600 MHz, so 6 ms is the limit.
  *
  *
+ * 13. A clock that never jumps back (see section 1): DraStic's own clock jumped back 4295 s every ~71.6 minutes
+ *     of play and whenever the system time changed, and the limiter then waited for the whole jump (the game
+ *     froze). Reproduced by moving the system clock back 20 s four times during Mario Kart DS: frozen 20 s every
+ *     time before, 61-62 frames/s throughout after.
+ *
+ * 2b. (Beta 3) The page flip (2) and the panel measurement (4) also work with the 752x560 screen of the Mini v4
+ *     and Flip; before, both were left out there (only 480 lines were accepted) and the limiter stayed at 60 Hz.
+ *     Measured on a Mini Plus with the screen set to 752x560, Mario Kart DS, 70 s: frames lost on the way to the
+ *     screen 103 of 4116 (old flip) -> 1 of 4113. With a plain flip the panel is now measured too.
+ *
+ * 14. (Beta 3) The SDL layer's Blur/Pixel choice (MENU+B) is remembered between sessions, and dsfast.log (next to
+ *     launch.sh) gets a short summary on exit (screen mode, flip mode, panel refresh, frames per second).
+ *
  * All act only inside the drastic executable (programs it starts inherit LD_PRELOAD). */
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -231,7 +244,10 @@ static void (*delay_us)(u32 us) = (void (*)(u32))0x080a7dc0u;
 static u32 (*audio_buffer_state)(void *a) = (u32 (*)(void *))0x080aa718u;
 static void (*audio_buffer_force_feed)(void *a) = (void (*)(void *))0x080aa760u;
 
-/* Replace DraStic's get_ticks_us (which overflows 32-bit tv_sec * 1e6 every ~35.8 min) with 64-bit monotonic time */
+/* DraStic's get_ticks_us() reads the wall clock (gettimeofday), computes (s32)tv_sec * 1000000 and
+   sign-extends bit 31, jumping -4295 s every ~71.6 minutes (2^32 us), and it also jumps whenever the
+   system time is changed. A jump back during the limiter's wait froze the game for the size of the jump.
+   Replace it with 64-bit CLOCK_MONOTONIC via mono_us(). Reported and fixed by Kmieciu4ever (PR #1). */
 static void dsfast_get_ticks_us(s64 *t) { *t = mono_us(); }
 
 #define CFG(s, off)    (*(u32 *)((char *)(s) + 0x85000 + (off)))
@@ -261,7 +277,6 @@ static void wait_us(u32 us)
     while (t - t0 < (s64)us);
 }
 
-static s64 last_sync_exit_us;
 static s64 prev_work_us;
 static u32 pair30_score;
 static int no_pair30;
@@ -344,7 +359,7 @@ timer:
     delta = (s32)((u32)tgt - (u32)now);
     late = 0;
     if (delta > 300000) {
-        /* Guard against >100 ms target skew (e.g. clock jump or long pause): resync instead of spinning */
+        /* Guard against >100 ms target skew (e.g. long pause or clock jump): resync instead of spinning */
         *target = now;
         delta = 0;
     }
@@ -414,14 +429,30 @@ frameskip:
 }
 
 static void *g_sys;
+/* diagnostics for dsfast.log (section 14): emulation time per frame, frames not drawn */
+static s64 sync_end_us;
+static u32 work_n, work_sum10, work_max, work_hist[5], undrawn_n;
+static void count_work(u32 w)
+{
+    work_n++;
+    work_sum10 += w / 10;
+    if (w > work_max)
+        work_max = w;
+    work_hist[w < 12000 ? 0 : w < 16700 ? 1 : w < 20000 ? 2 : w < 33300 ? 3 : 4]++;
+}
+
 void dsfast_system_frame_sync(void *sys)
 {
-    s64 enter_us = mono_us();
-    s64 work_us = last_sync_exit_us ? (enter_us - last_sync_exit_us) : 0;
+    s64 t = mono_us();
+    s64 work_us = sync_end_us ? (t - sync_end_us) : 0;
     g_sys = sys;
+    if (sync_end_us && t - sync_end_us < 200000)   /* not after a menu or a load */
+        count_work((u32)(t - sync_end_us));
     frame_ready();
     frame_sync(sys, work_us);
-    last_sync_exit_us = mono_us();
+    if (F(sys, SKIP_NEXT))
+        undrawn_n++;
+    sync_end_us = mono_us();
 }
 
 /* ------------------------------------------------------------------ 2. page flip */
@@ -429,8 +460,9 @@ void dsfast_system_frame_sync(void *sys)
 #define FBIOGET_VSCREENINFO 0x4600
 #define FBIOPUT_VSCREENINFO 0x4601
 #define FBIOPAN_DISPLAY     0x4606
-#define PAGE_H              480
+static u32 page_h;                  /* screen height: 480 (Mini Plus, v2/v3) or 560 (Mini v4, Flip) */
 
+extern char *getenv(const char *name);
 struct fbvar { u32 xres, yres, xres_virtual, yres_virtual, xoffset, yoffset; u32 rest[34]; };
 
 static int (*real_ioctl)(int, unsigned long, void *);
@@ -441,6 +473,8 @@ static pcond_t fcond;
 static int pending = -1, ffd;
 static u32 orig_yres_virtual;
 static struct fbvar fvar;
+static u32 flip_xres, flip_n, flip_waits, vsync_n, flip_wait_us, flip_hist[4];
+static long start_sec;
 
 static void measure_vsync(void)
 {
@@ -449,8 +483,11 @@ static void measure_vsync(void)
     s64 t = mono_us();
     u32 d = (u32)(t - last);
     last = t;
+    if (d < 200000)                      /* flip intervals for dsfast.log, not across menus */
+        flip_hist[d < 14000 ? 0 : d < 19500 ? 1 : d < 36000 ? 2 : 3]++;
     if (d < 14000 || d > 19500)          /* not one refresh apart */
         return;
+    vsync_n++;
     if (n < 120) {                       /* first estimate: plain average */
         sum += d;
         if (++n == 120)
@@ -486,15 +523,22 @@ static void flip_setup(int fd)
     struct fbvar cur;
     unsigned long th;
     flip_state = -1;
-    if (real_ioctl(fd, FBIOGET_VSCREENINFO, &cur) || cur.yres != PAGE_H)
+    if (real_ioctl(fd, FBIOGET_VSCREENINFO, &cur))
+        return;
+    page_h = cur.yres;
+    flip_xres = cur.xres;
+    /* 640x480 (Mini Plus, v2/v3) and 752x560 (Mini v4, Flip, set by the launcher) */
+    if (cur.yres != 480 && cur.yres != 560)
+        return;
+    if (getenv("DSFAST_PLAINFLIP"))   /* for comparisons: keep the SDL layer's own flip */
         return;
     orig_yres_virtual = cur.yres_virtual;
-    if (cur.yres_virtual < 3 * PAGE_H) {
-        cur.yres_virtual = 3 * PAGE_H;
+    if (cur.yres_virtual < 3 * page_h) {
+        cur.yres_virtual = 3 * page_h;
         if (real_ioctl(fd, FBIOPUT_VSCREENINFO, &cur))
             return;
         real_ioctl(fd, FBIOGET_VSCREENINFO, &cur);
-        if (cur.yres_virtual < 3 * PAGE_H)
+        if (cur.yres_virtual < 3 * page_h)
             return;
     }
     fvar = cur;
@@ -523,22 +567,138 @@ int ioctl(int fd, unsigned long req, void *arg)
         return real_ioctl(fd, req, arg);
     if (!flip_state)
         flip_setup(fd);
-    if (flip_state != 1)
-        return real_ioctl(fd, req, arg);
-    page = v->yoffset / PAGE_H;
+    flip_n++;
+    if (flip_state != 1) {
+        /* plain flip (returns at the vsync): still measure the panel, so the limiter follows it (4) */
+        int r = real_ioctl(fd, req, arg);
+        measure_vsync();
+        return r;
+    }
+    page = v->yoffset / page_h;
     pthread_mutex_lock(&fmtx);
-    while (pending >= 0)               /* the previous flip has not reached the screen yet */
-        pthread_cond_wait(&fcond, &fmtx);
-    pending = (int)(page * PAGE_H);
+    if (pending >= 0) {                /* the previous flip has not reached the screen yet */
+        s64 t0 = mono_us();
+        while (pending >= 0)
+            pthread_cond_wait(&fcond, &fmtx);
+        flip_waits++;
+        flip_wait_us += (u32)(mono_us() - t0);
+    }
+    pending = (int)(page * page_h);
     pthread_cond_broadcast(&fcond);
     pthread_mutex_unlock(&fmtx);
-    /* the SDL layer does yoffset ^= 480 after this call: make that land on the next of the 3 pages */
-    v->yoffset = (((page + 1) % 3) * PAGE_H) ^ PAGE_H;
+    /* the SDL layer does yoffset ^= height after this call: make that land on the next of the 3 pages */
+    v->yoffset = (((page + 1) % 3) * page_h) ^ page_h;
     return 0;
+}
+
+/* ------------------------------------------------------------------ 14. Blur remembered, and a short log
+   The SDL layer's Blur/Pixel choice (MENU+B, its variable down_scale: 0 = Blur) lives only in memory and starts
+   as Pixel every time. It is kept in config/.dsfast_blur (exists = Blur) and set again at start.
+   On exit, dsfast.log (next to launch.sh) gets one block: screen mode, flip mode, measured panel refresh,
+   frames per second, so that players on other models can send it with a report. */
+/* libc's stdio, under other names (no headers here) */
+extern void *log_fopen(const char *path, const char *mode) __asm__("fopen");
+extern int log_printf(void *f, const char *fmt, ...) __asm__("fprintf");
+extern int log_fclose(void *f) __asm__("fclose");
+extern int unlink(const char *path);
+extern int access(const char *path, int mode);
+#define BLUR_FILE "config/.dsfast_blur"
+static int *sdl_down_scale;
+
+static void blur_setup(void)
+{
+    u8 *init = (u8 *)dlsym((void *)0, "SDL_Init");
+    /* only with the libSDL2 v1.8 build (same check as in hide_setup) */
+    if (!init || *(u32 *)(init - 0x35470 + 0xe6178) != 0xe92d4ff0u)
+        return;
+    sdl_down_scale = (int *)(init - 0x35470 + 0x122f38);
+    if (*sdl_down_scale != 0 && *sdl_down_scale != 1) {   /* not the variable we expect */
+        sdl_down_scale = 0;
+        return;
+    }
+    if (access(BLUR_FILE, 0) == 0)
+        *sdl_down_scale = 0;
+}
+
+/* the CPU clock as the chip runs it (OnionOS's cpuclock programs the PLL directly; cpufreq does not see it) */
+extern int open(const char *path, int flags, ...);
+extern int close(int fd);
+extern void *mmap(void *addr, unsigned long len, int prot, int flags, int fd, long off);
+extern int munmap(void *addr, unsigned long len);
+extern int log_scanf(void *f, const char *fmt, ...) __asm__("fscanf");
+static u32 cpu_mhz(void)
+{
+    int fd = open("/dev/mem", 2 | 0x101000);   /* O_RDWR | O_SYNC */
+    volatile u32 *r;
+    u32 lpf, pd, mhz = 0;
+    if (fd < 0)
+        return 0;
+    r = (volatile u32 *)mmap(0, 4096, 1, 1, fd, 0x1f206000);   /* PROT_READ, MAP_SHARED: the CPU PLL */
+    close(fd);
+    if (r == (volatile u32 *)-1)
+        return 0;
+    lpf = (r[0x548 / 4] & 0xffff) | (r[0x54c / 4] & 0xffff) << 16;
+    pd = (r[0x464 / 4] & 0xffff) + 1;
+    if (lpf >> 6)
+        mhz = 226492416u / (lpf >> 6) / 2 / pd;   /* 432 MHz * 2^19 / lpf * 2 * 16 / pd */
+    munmap((void *)r, 4096);
+    return mhz;
+}
+static u32 mhz_start;
+
+static void write_log(void)
+{
+    void *f = log_fopen("dsfast.log", "w");
+    struct timespec ts;
+    u32 q = vsync_q8, hz100 = q >= 10 ? 2560000000u / (q / 10) : 0, secs, fps10;
+    if (!f)
+        return;
+    clock_gettime(1, &ts);
+    secs = (u32)(ts.tv_sec - start_sec);
+    fps10 = secs ? (u32)frame_seq * 10 / secs : 0;
+    log_printf(f, "libdsfast beta3\n");
+    log_printf(f, "screen: %ux%u, pages: %s\n", flip_xres, page_h, flip_state == 1 ? "3 (flip without blocking)" :
+            flip_state == -1 ? "2 (plain flip)" : "not set up");
+    log_printf(f, "panel refresh: %u.%02u Hz (%u vsyncs measured)\n", hz100 / 100, hz100 % 100, vsync_n);
+    log_printf(f, "time: %u s, frames emulated: %u (%u.%u per s), screen flips: %u\n", secs, (u32)frame_seq,
+            fps10 / 10, fps10 % 10, flip_n);
+    log_printf(f, "flips that waited for the previous one: %u (%u ms in all)\n", flip_waits, flip_wait_us / 1000);
+    log_printf(f, "blur: %s\n", !sdl_down_scale ? "unknown" : *sdl_down_scale ? "off (Pixel)" : "on");
+    {
+        int model = 0;
+        void *m = log_fopen("/tmp/deviceModel", "r");
+        if (m) {
+            log_scanf(m, "%d", &model);
+            log_fclose(m);
+        }
+        log_printf(f, "device model: %d, CPU clock: %u MHz at start, %u MHz at exit\n", model, mhz_start, cpu_mhz());
+    }
+    if (work_n) {
+        u32 avg100 = work_sum10 / work_n * 10 / 100;   /* in 0.1 ms */
+        log_printf(f, "emulation per frame: average %u.%u ms, worst %u.%u ms\n", avg100 / 10, avg100 % 10,
+                   work_max / 1000, work_max / 100 % 10);
+        log_printf(f, "frames by emulation time: <12 ms %u, 12-16.7 ms %u, 16.7-20 ms %u, 20-33 ms %u, >33 ms %u\n",
+                   work_hist[0], work_hist[1], work_hist[2], work_hist[3], work_hist[4]);
+    }
+    log_printf(f, "frames not drawn (frameskip): %u\n", undrawn_n);
+    log_printf(f, "time between screen flips: <14 ms %u, 1 refresh %u, 2 refreshes %u, more %u\n",
+               flip_hist[0], flip_hist[1], flip_hist[2], flip_hist[3]);
+    log_fclose(f);
 }
 
 __attribute__((destructor)) static void dsfast_end(void)
 {
+    if (!active)
+        return;
+    if (sdl_down_scale) {
+        if (*sdl_down_scale == 0) {
+            void *f = log_fopen(BLUR_FILE, "w");
+            if (f)
+                log_fclose(f);
+        } else
+            unlink(BLUR_FILE);
+    }
+    write_log();
     if (flip_state != 1)
         return;
     pthread_mutex_lock(&fmtx);
@@ -899,9 +1059,16 @@ __attribute__((constructor)) static void dsfast_init(void)
     if (*(u32 *)FN_GET_TICKS_US == 0xe16d40fcu)
         patch(FN_GET_TICKS_US, (void *)dsfast_get_ticks_us);
     patch(FN_SYSTEM_FRAME_SYNC, (void *)dsfast_system_frame_sync);
+    {
+        struct timespec ts;
+        clock_gettime(1, &ts);
+        start_sec = ts.tv_sec;
+    }
     hide_setup();
     split_setup();
     copy3d_setup();
     neon3d_setup();
     steal3d_setup();
+    blur_setup();
+    mhz_start = cpu_mhz();
 }
