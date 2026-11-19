@@ -466,7 +466,6 @@ extern char *getenv(const char *name);
 struct fbvar { u32 xres, yres, xres_virtual, yres_virtual, xoffset, yoffset; u32 rest[34]; };
 
 static int (*real_ioctl)(int, unsigned long, void *);
-static void (*gfx_wait_fn)(void);
 static int flip_state;            /* 0 not set up, 1 on, -1 off (plain flips) */
 static pmutex_t fmtx;
 static pcond_t fcond;
@@ -506,8 +505,6 @@ static void *flip_thread(void *p)
             pthread_cond_wait(&fcond, &fmtx);
         fvar.yoffset = (u32)pending;
         pthread_mutex_unlock(&fmtx);
-        if (gfx_wait_fn)
-            gfx_wait_fn(); /* finish async MI_GFX blit on core 0 before scanning out the page */
         real_ioctl(ffd, FBIOPAN_DISPLAY, &fvar); /* returns at the vsync */
         measure_vsync();
         pthread_mutex_lock(&fmtx);
@@ -543,15 +540,6 @@ static void flip_setup(int fd)
     }
     fvar = cur;
     ffd = fd;
-    if (!getenv("DSFAST_NOASYNC")) {
-        /* Offload MI_GFX_WaitAllDone from SDL's core 1 video_handler to core 0 flip_thread */
-        void (*wf)(void) = (void (*)(void))dlsym((void *)0, "mmiyoo_gfx_wait");
-        void (*sa)(int) = (void (*)(int))dlsym((void *)0, "mmiyoo_set_async_gfx");
-        if (wf && sa) {
-            gfx_wait_fn = wf;
-            sa(1);
-        }
-    }
     if (pthread_create(&th, 0, flip_thread, 0))
         return;
     flip_state = 1;
