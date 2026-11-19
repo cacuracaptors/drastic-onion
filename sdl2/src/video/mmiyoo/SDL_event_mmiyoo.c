@@ -197,6 +197,35 @@ const SDL_Scancode code[]={
 
 int volume_inc(void);
 int volume_dec(void);
+static volatile int sync_mouse_pos = 0;
+
+/* Map virtual 256x192 DS coordinates into the actual SDL window rectangle used by SDL_RenderSetLogicalSize(256, 384) */
+static void send_mouse_pos(void)
+{
+    int w = 640;
+    int h = 480;
+    int sh = 0;
+    int sw = 0;
+    int xoff = 0;
+    int mx = 0;
+    int my = 0;
+
+    if (vid.window) {
+        SDL_GetWindowSize(vid.window, &w, &h);
+    }
+    if (w <= 0) {
+        w = 640;
+    }
+    if (h <= 0) {
+        h = 480;
+    }
+    sh = h / 2;
+    sw = (256 * h) / 384;
+    xoff = (w - sw) / 2;
+    mx = xoff + (evt.mouse.x * sw) / evt.mouse.maxx;
+    my = (nds.pen.pos ? sh : 0) + (evt.mouse.y * sh) / evt.mouse.maxy;
+    SDL_SendMouseMotion(vid.window, 0, 0, mx, my);
+}
 
 static void check_mouse_pos(void)
 {
@@ -479,6 +508,7 @@ int EventUpdate(void *data)
                                 break;
                             default:
                                 nds.pen.pos = 1;
+                                sync_mouse_pos = 1;
                                 break;
                             }
                         }
@@ -497,6 +527,7 @@ int EventUpdate(void *data)
                                 break;
                             default:
                                 nds.pen.pos = 0;
+                                sync_mouse_pos = 1;
                                 break;
                             }
                         }
@@ -522,6 +553,7 @@ int EventUpdate(void *data)
 
                             if (evt.mode == MMIYOO_MOUSE_MODE) {
                                 release_all_keys();
+                                sync_mouse_pos = 1;
                             }
                             lower_speed = 0;
                         }
@@ -753,6 +785,7 @@ int EventUpdate(void *data)
 
                             if (evt.mode == MMIYOO_MOUSE_MODE) {
                                 release_all_keys();
+                                sync_mouse_pos = 1;
                             }
                             lower_speed = 0;
                         }
@@ -1000,13 +1033,9 @@ void MMIYOO_PumpEvents(_THIS)
             }
             check_mouse_pos();
 
-            if(updated){
-                int x = 0;
-                int y = 0;
-
-                x = (evt.mouse.x * 160) / evt.mouse.maxx;
-                y = (evt.mouse.y * 120) / evt.mouse.maxy;
-                SDL_SendMouseMotion(vid.window, 0, 0, x + 80, y + (nds.pen.pos ? 120 : 0));
+            if (updated || sync_mouse_pos) {
+                sync_mouse_pos = 0;
+                send_mouse_pos();
             }
 
 #if defined(TRIMUI) || defined(FUNKEYS) || defined(PANDORA)
