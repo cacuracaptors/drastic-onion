@@ -88,7 +88,7 @@ The release library is built with clang (no libc headers needed):
 
 ```
 clang --target=armv7a-linux-gnueabihf -mfloat-abi=hard -O2 -fPIC -shared -nostdlib -fuse-ld=lld \
-      -o libdsfast.so dsfast.c
+      -o libdsfast.so dsfast.c dsfast_neon.S
 ```
 
 ## Credits

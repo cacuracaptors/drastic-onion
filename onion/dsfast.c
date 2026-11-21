@@ -1091,6 +1091,61 @@ static void split_setup(void)
     patch(FN_VIDEO_3D_FINISH_RENDERING, (void *)split_finish_rendering);
 }
 
+/* ------------------------------------------------------------------ 18. 3D 4x skipped-frame copy bypass
+   When a 4x frame is skipped right before finishing 3D, update_frame_3d_4x copies the entire
+   512x384 (768 KB) previous color buffer via memcpy. Pointing color_buffer_render straight at
+   color_buffer_last_rendered achieves the exact same reuse in a single store (DSFAST_NO_COPY3D=1). */
+#define FN_3D_4X_SKIP_COPY 0x08078458u
+static void copy3d_setup(void)
+{
+    const char *off = getenv("DSFAST_NO_COPY3D");
+    u32 *p = (u32 *)FN_3D_4X_SKIP_COPY;
+    if (off && off[0] == '1')
+        return;
+    if (p[0] == 0xe3a02703u && p[1] == 0xe28dd01cu) {
+        mprotect((void *)(FN_3D_4X_SKIP_COPY & ~4095u), 8192, 7);
+        p[0] = 0xe5881054u; /* str r1, [r8, #84] (color_buffer_render = color_buffer_last_rendered) */
+        p[1] = 0xea000018u; /* b 0x080784c4 */
+        flush_icache(p, p + 2);
+    }
+}
+
+/* ------------------------------------------------------------------ 19. bit-exact NEON + PLD 3D 4x & 2D kernels */
+#define HIDDEN __attribute__((visibility("hidden")))
+HIDDEN extern void dsfast_resolve_bin_4x(void);
+HIDDEN extern void dsfast_writeback_4x(void);
+HIDDEN extern void dsfast_load_depth_4x(void);
+HIDDEN extern void dsfast_load_depth_colors_id_4x(void);
+HIDDEN extern void dsfast_writeback_all_pass_4x(void);
+HIDDEN extern void dsfast_render_scanline_set_3d_visibility(void);
+HIDDEN extern void dsfast_select_pixels_binary32(void);
+HIDDEN extern void dsfast_edge_mark_4x(void);
+HIDDEN extern void dsfast_edge_identify_4x(void);
+#undef HIDDEN
+
+static void neon3d_setup(void)
+{
+    static const struct { u32 addr; u32 insn; void (*fn)(void); } k[] = {
+        { 0x080c50fcu, 0xe3a03020u, dsfast_resolve_bin_4x },
+        { 0x080c4a90u, 0xe92d4ff0u, dsfast_writeback_4x },
+        { 0x080c49d0u, 0xe282cd16u, dsfast_load_depth_4x },
+        { 0x080c4a18u, 0xe92d47f0u, dsfast_load_depth_colors_id_4x },
+        { 0x080c4b08u, 0xe92d4070u, dsfast_writeback_all_pass_4x },
+        { 0x08048c50u, 0xe16d41f0u, dsfast_render_scanline_set_3d_visibility },
+        { 0x080bef80u, 0xe92d4010u, dsfast_select_pixels_binary32 },
+        { 0x080c55a0u, 0xe92d4000u, dsfast_edge_mark_4x },
+        { 0x080c5658u, 0xe92d4030u, dsfast_edge_identify_4x },
+    };
+    const char *off = getenv("DSFAST_NO_NEON3D");
+    unsigned i;
+    if (off && off[0] == '1')
+        return;
+    for (i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
+        if (*(u32 *)k[i].addr == k[i].insn)
+            patch(k[i].addr, (void *)k[i].fn);
+    }
+}
+
 __attribute__((constructor)) static void dsfast_init(void)
 {
     char exe[256];
@@ -1117,6 +1172,8 @@ __attribute__((constructor)) static void dsfast_init(void)
     }
     hide_setup();
     split_setup();
+    copy3d_setup();
+    neon3d_setup();
     prof_setup();
     blur_setup();
     mhz_start = cpu_mhz();
