@@ -4386,7 +4386,7 @@ int GFX_Copy(const void *pixels, SDL_Rect srcrect, SDL_Rect dstrect, int pitch, 
     gfx.hw.dst.surf.eColorFmt = E_MI_GFX_FMT_ARGB8888;
     gfx.hw.dst.surf.phyAddr = gfx.fb.phyAddr + (FB_W * gfx.vinfo.yoffset * FB_BPP);
 
-    MI_SYS_FlushInvCache(src_vir, copy_bytes);
+    MI_SYS_FlushInvCache(src_vir, (size_t)srcrect.h * (size_t)pitch);
     MI_GFX_BitBlit(&gfx.hw.src.surf, &gfx.hw.src.rt, &gfx.hw.dst.surf, &gfx.hw.dst.rt, &gfx.hw.opt, &u16Fence);
 
     if ((nds.menu.enable == 0) && (srcrect.w != 800) && ((srcrect.w == 256) || (srcrect.w == 512)) && (nds.overlay.sel < nds.overlay.max)) {
