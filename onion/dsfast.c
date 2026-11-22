@@ -194,7 +194,7 @@ snd_sframes snd_pcm_writei(void *pcm, const void *buffer, unsigned long size)
     if (!active || size < 2 || size > 4096)
         return real_writei(pcm, buffer, size);
     now = mono_us();
-    if (!a_t0 || now - a_tlast > 200000) {   /* start, or sound was stopped (menu, loading) */
+    if (!a_t0 || now - a_tlast > 80000) {    /* start, or sound was stopped (menu, loading, savestate) */
         a_t0 = now;
         a_written = 0;
         a_last[0] = in[0];
