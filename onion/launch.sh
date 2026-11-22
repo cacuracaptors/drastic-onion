@@ -132,7 +132,7 @@ if [ "$USE_752x560_RES" = "1" ]; then
     ensure_752x560_mode
 fi
 
-LD_PRELOAD="$(pwd)/libs/libdsfast.so${LD_PRELOAD:+:$LD_PRELOAD}" ./drastic "$1"
+DSFAST_FAST3D="${DSFAST_FAST3D:-3}" LD_PRELOAD="$(pwd)/libs/libdsfast.so${LD_PRELOAD:+:$LD_PRELOAD}" ./drastic "$1"
 
 sync
 restore_system

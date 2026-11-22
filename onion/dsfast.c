@@ -89,6 +89,16 @@
  *
  * 17. DSFAST_PROF=1: per-frame timing of the 2D, the 3D and the waits in dsfast.log, for studies.
  *
+ * 18-20. (Beta 5) High-resolution 3D (hires_3d = 1): the 4x polygon flush is redrawn in NEON (f3d_v5.h, opaque,
+ *     Gouraud and translucent polygons, checked bit-exact; launch.sh sets DSFAST_FAST3D=3) and the vertex
+ *     lighting loop runs in NEON (bit-exact). With ksielick's PR 7 (hidden Engine B skipped, 3D bins shared
+ *     between the cores, thread priorities): GTA Chinatown Wars, recorded drive, 2315 -> 3359 frames on screen
+ *     in 75 s, frames over 33 ms 150 -> 16. The thread priorities of PR 7 apply only while hires_3d is on: at 1x
+ *     they cost 0.3 ms per frame (MKDS), so there every thread stays at nice 0 as in Beta 4.
+ *     A delay over 100 ms is dropped instead of being made up by running fast (a game sped up for a while after
+ *     a slow stretch, e.g. switching from high resolution with fixed frameskip to low resolution), and sound
+ *     resyncs after an 80 ms gap (ksielick's PR 5) instead of 200 ms.
+ *
  * All act only inside the drastic executable (programs it starts inherit LD_PRELOAD). */
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -128,9 +138,11 @@ static long futex(volatile int *addr, int op, int val, struct timespec *ts)
 }
 static volatile s64 last_frame_us;
 static u32 frames_n;
+static void samp_frame(void);
 static void frame_ready(void)
 {
     frames_n++;
+    samp_frame();
     last_frame_us = mono_us();
     __sync_fetch_and_add(&frame_seq, 1);
     futex(&frame_seq, 1 | 128, 0x7fffffff, 0);   /* FUTEX_WAKE_PRIVATE */
@@ -169,6 +181,9 @@ int usleep(unsigned int us)
 
 /* refresh period measured by the flip thread, in 1/256 us; 0 until known */
 static volatile u32 vsync_q8;
+static int gl_mode;
+static volatile u32 gl_calls, gl_verts, gl_bad, gl_badv;
+static u32 split_n, split_on;   /* 11: 3D frames, frames split (for dsfast.log) */
 
 /* ------------------------------------------------------------------ 5. sound at the rate it is played
    DraStic's sound (44100 Hz stereo s16) goes through snd_pcm_writei of the SDL layer's own ALSA replacement.
@@ -276,19 +291,99 @@ static void dsfast_get_ticks_us(s64 *t) { *t = mono_us(); }
 #define SKIPPED        0xe6f  /* frames skipped in a row */
 
 /* times in 1/3 microsecond, as DraStic keeps them */
-static void wait_us(u32 us)
+extern char *getenv(const char *name);
+/* 18. Wake on the vsync instead of spinning (DSFAST_VSWAIT=1, under test). Sleeps here last until the next
+   10 ms tick (no high-resolution timers: usleep(100..8000) all measured 10 ms), so the wait slept to 11 ms
+   before the target and spun the rest: ~13% of the emulation thread's time in samples (GTA), on the core it
+   shares with the 2D thread and the first 3D helper. A second thread in FBIO_WAITFORVSYNC was tried and
+   starved the flips (FBIOPAN_DISPLAY waited 0.8 s each): only the flip thread may wait for the vsync.
+   So: the flip thread wakes the limiter when its FBIOPAN_DISPLAY returns (at a refresh), the limiter's
+   target is pulled slowly onto the refreshes (at most 100 us per frame), and while a flip is on its way the
+   limiter sleeps until it returns instead of spinning. Without a flip in flight it sleeps and spins as before. */
+static volatile int vs_seq, vs_inflight;
+static volatile s64 vs_last;
+static int vs_mode;                 /* 0 off (DSFAST_VSWAIT=0), 1 wake only, 2 wake + align (default) */
+static u32 vs_waits, vs_woke, vs_spun;
+static void vs_setup(void)
 {
-    s64 t0, t;
-    if (!us)
-        return;
-    t0 = mono_us();
-    if (us > 11000)
-        delay_us(us - 11000);
-    do
-        t = mono_us();
-    while (t - t0 < (s64)us);
+    static int done;
+    if (!done) {
+        done = 1;
+        {
+            char *e = getenv("DSFAST_VSWAIT");
+            vs_mode = !e ? 2 : e[0] == '0' ? 0 : e[0] == '1' ? 1 : 2;   /* default: wake + align */
+        }
+    }
+}
+/* called by the flip thread when FBIOPAN_DISPLAY returns */
+static void vs_refresh(s64 t)
+{
+    vs_last = t;
+    __sync_fetch_and_add(&vs_seq, 1);
+    if (vs_mode)
+        futex(&vs_seq, 1 | 128, 0x7fffffff, 0);     /* FUTEX_WAKE_PRIVATE */
+}
+/* the target (us) moved onto the refresh grid, at most 100 us per frame; returns the shift in us */
+static s32 vs_align(s64 tgt_us)
+{
+    u32 per = vsync_q8 >> 8;
+    s64 last = vs_last;
+    s32 e;
+    if (vs_mode != 2 || per < 15000 || !last || tgt_us - last > 2000000 || tgt_us < last)
+        return 0;
+    e = (s32)((u32)(tgt_us - last) % per);      /* 0..per-1 after a refresh */
+    if (e < (s32)per / 2)
+        return e > 100 ? -100 : -e;
+    e = (s32)per - e;
+    return e > 100 ? 100 : e;
+}
+/* 1 if woken by a refresh at the target, 0 to sleep and spin the rest as before */
+static int vs_wait(s64 end)
+{
+    vs_waits++;
+    for (;;) {
+        int s = vs_seq;
+        u32 per = vsync_q8 >> 8;
+        s64 t = mono_us(), nv;
+        struct timespec ts = { 0, 40000000 };
+        if (t >= end - 300) {
+            vs_woke++;
+            return 1;
+        }
+        if (!vs_inflight || per < 15000) {
+            vs_spun++;
+            return 0;
+        }
+        {
+            s64 last = vs_last;                     /* when the flip on its way returns */
+            u32 d = t - last < 1000000 ? (u32)(t - last) : 0;
+            nv = last + (s64)((d / per + 1) * per);
+        }
+        if (nv > end + 300) {
+            vs_spun++;
+            return 0;
+        }
+        futex(&vs_seq, 0 | 128, s, &ts);           /* FUTEX_WAIT_PRIVATE until the flip returns */
+    }
 }
 
+static void wait_us(u32 us)
+{
+    s64 end, t;
+    if (!us)
+        return;
+    end = mono_us() + us;
+    if (vs_mode && vs_wait(end))
+        return;
+    t = mono_us();
+    if (end - t > 11000)
+        delay_us((u32)(end - t) - 11000);
+    do
+        t = mono_us();
+    while (t < end);
+}
+
+static u32 resync_n, resync_ms;   /* frames that fell >100 ms behind: debt dropped (dsfast.log) */
 static void frame_sync(void *sys)
 {
     s64 *target = (s64 *)((char *)sys + 0x2aeae50);
@@ -317,6 +412,13 @@ static void frame_sync(void *sys)
     }
     *target += interval;
     tgt = *target;
+    if (vs_mode && !CFG(sys, FAST_FORWARD) && !F(sys, AUDIO_MODE)) {
+        s32 d3 = (s32)((u32)tgt - (u32)now);
+        if (d3 > -150000 && d3 < 150000) {
+            *target += (s64)(vs_align(t + d3 / 3) * 3);
+            tgt = *target;
+        }
+    }
     if (CFG(sys, FAST_FORWARD)) {
         *target = now;
         tgt = now;
@@ -356,6 +458,15 @@ timer:
         /* Guard against >100 ms target skew (e.g. long pause or clock jump): resync instead of spinning */
         *target = now;
         delta = 0;
+    } else if (delta < -300000) {
+        /* More than 100 ms behind (a stretch that could not keep 60 fps, e.g. high-resolution 3D with a fixed
+           frameskip): drop the debt instead of running fast until it is paid back, which sped the game up for
+           a while after switching to low resolution. Short delays (<100 ms) are still caught up as before. */
+        resync_n++;
+        resync_ms += (u32)(-delta) / 3000;
+        *target = now;
+        delta = 0;
+        late = 1;
     }
     if (delta > 0)
         wait_us((u32)delta / 3);
@@ -434,10 +545,13 @@ static void count_work(u32 w)
     work_hist[w < 12000 ? 0 : w < 16700 ? 1 : w < 20000 ? 2 : w < 33300 ? 3 : 4]++;
 }
 
+static void nice_follow(void);
 void dsfast_system_frame_sync(void *sys)
 {
     s64 t = mono_us();
     g_sys = sys;
+    vs_setup();
+    nice_follow();
     int counted = sync_end_us && t - sync_end_us < 200000;   /* not after a menu or a load */
     copy_setup_late();
     if (counted)
@@ -500,8 +614,11 @@ static void *flip_thread(void *p)
         while (pending < 0)
             pthread_cond_wait(&fcond, &fmtx);
         fvar.yoffset = (u32)pending;
+        vs_inflight = 1;
         pthread_mutex_unlock(&fmtx);
         real_ioctl(ffd, FBIOPAN_DISPLAY, &fvar); /* returns at the vsync */
+        vs_inflight = 0;
+        vs_refresh(mono_us());
         measure_vsync();
         pthread_mutex_lock(&fmtx);
         pending = -1;
@@ -667,7 +784,7 @@ static void write_log(void)
     clock_gettime(1, &ts);
     secs = (u32)(ts.tv_sec - start_sec);
     fps10 = secs ? frames_n * 10 / secs : 0;
-    log_printf(f, "libdsfast beta4\n");
+    log_printf(f, "libdsfast beta5\n");
     log_printf(f, "screen: %ux%u, pages: %s\n", flip_xres, page_h, flip_state == 1 ? "3 (flip without blocking)" :
             flip_state == -1 ? "2 (plain flip)" : "not set up");
     log_printf(f, "panel refresh: %u.%02u Hz (%u vsyncs measured)\n", hz100 / 100, hz100 % 100, vsync_n);
@@ -691,6 +808,13 @@ static void write_log(void)
         log_printf(f, "frames by emulation time: <12 ms %u, 12-16.7 ms %u, 16.7-20 ms %u, 20-33 ms %u, >33 ms %u\n",
                    work_hist[0], work_hist[1], work_hist[2], work_hist[3], work_hist[4]);
     }
+    if (split_n)
+        log_printf(f, "3D split over both cores: %u of %u 3D frames\n", split_on, split_n);
+        log_printf(f, "vertex lighting (NEON): mode %d%s, checked %u calls %u vertices, differing calls %u vertices %u\n",
+                   gl_mode, gl_mode < 0 ? " (DraStic code differs: off)" : "", gl_calls, gl_verts, gl_bad, gl_badv);
+    if (vs_mode)
+        log_printf(f, "vsync wake: waits %u, woken at the target by a flip %u, slept and spun %u\n",
+                   vs_waits, vs_woke, vs_spun);
     if (work_n) {
         /* percentiles from the 1 ms histogram: the frame time that p% of the frames stay under */
         static const u32 pc[4] = { 500, 900, 990, 999 };   /* per mille */
@@ -711,6 +835,7 @@ static void write_log(void)
         log_printf(f, "  time on the emulation thread: average %u us, worst %u us; waits for the copy: %u (%u ms)\n",
                    us_main_sum10 / (us_async + us_sync) * 10, us_main_max, copy_waits, copy_wait_us / 1000);
     log_printf(f, "frames not drawn (frameskip): %u\n", undrawn_n);
+    log_printf(f, "fell over 100 ms behind (caught up at once instead of running fast): %u times, %u ms in all\n", resync_n, resync_ms);
     if (prof_on) {
         int k;
         for (k = 1; k >= 0; k--) {
@@ -733,6 +858,9 @@ static void write_log(void)
     log_fclose(f);
 }
 
+static void polyprof_write(void);
+static void f3d_write(void);
+static void samp_write(void);
 __attribute__((destructor)) static void dsfast_end(void)
 {
     if (!active)
@@ -747,6 +875,9 @@ __attribute__((destructor)) static void dsfast_end(void)
     }
     settings_save();
     write_log();
+    polyprof_write();
+    f3d_write();
+    samp_write();
     if (flip_state != 1)
         return;
     pthread_mutex_lock(&fmtx);
@@ -801,7 +932,31 @@ static void set_core(unsigned long mask) { sys3(241, 0, sizeof(mask), (long)&mas
 #define FN_VIDEO_3D_RENDER_THREAD 0x080782dcu  /* 3D helper threads (initialize_video_3d always makes 3) */
 static int helpers_seen;
 static int use_nice = 1;
-struct tramp { void *(*fn)(void *); void *arg; unsigned long mask; int nice; };
+/* PR 7 priorities (flip -8, Main -5, Engine B -5, first 3D helper +5) help only in high resolution, where they
+   keep the 3D split on and the hidden-screen skip fed; at 1x they made the split latch on twice as often and cost
+   0.3 ms per frame (MKDS). So each thread's tid is kept and nice_follow() switches between them and 0 (Beta 4)
+   whenever high-resolution 3D is turned on or off. */
+static int nice_tid[4];                 /* 0 Main, 1 Engine B, 2 flip, 3 first 3D helper */
+static const signed char nice_hi[4] = { -5, -5, -8, 5 };
+static int nice_state = -1;
+static void nice_apply(int hi)
+{
+    int i;
+    nice_state = hi;
+    for (i = 0; i < 4; i++)
+        if (nice_tid[i])
+            sys3(97, 0, nice_tid[i], hi ? nice_hi[i] : 0);   /* setpriority(PRIO_PROCESS, tid, n) */
+}
+static void nice_follow(void)
+{
+    int hi;
+    if (!use_nice)
+        return;
+    hi = *(u8 *)(0x0aee952cu + 0x19) || *(u8 *)(0x0aee952cu + 28 + 0x19);
+    if (hi != nice_state)
+        nice_apply(hi);
+}
+struct tramp { void *(*fn)(void *); void *arg; unsigned long mask; int nice; int role; };
 extern void *malloc(unsigned int n);
 extern void free(void *p);
 static void *tramp_run(void *p)
@@ -811,8 +966,12 @@ static void *tramp_run(void *p)
     set_core(t.mask);
     /* Main sets -5 before spawning threads, which clone() inherits; reset each child
      * explicitly so flip (-8) > Main (-5) == Engine B (-5) > w0 (+5), and others stay at 0. */
-    if (use_nice)
-        sys3(97, 0, 0, t.nice);
+    if (t.role >= 0) {
+        nice_tid[t.role] = (int)sys3(224, 0, 0, 0);   /* gettid */
+        if (use_nice)
+            sys3(97, 0, 0, nice_state > 0 ? t.nice : 0);
+    } else if (use_nice)
+        sys3(97, 0, 0, 0);   /* clone() inherits Main's nice (-5 in high resolution): others stay at 0 */
     return t.fn(t.arg);
 }
 int pthread_create(unsigned long *th, void *attr, void *(*fn)(void *), void *arg)
@@ -820,21 +979,24 @@ int pthread_create(unsigned long *th, void *attr, void *(*fn)(void *), void *arg
     static int (*real)(unsigned long *, void *, void *(*)(void *), void *);
     u32 a = (u32)fn;
     unsigned long mask = CORE1;   /* 3D (video_3d_run_thread, video_3d_render_thread), SDL audio and video... */
-    int nice = 0;
+    int nice = 0, role = -1;
     struct tramp *t;
     if (!real)
         real = (int (*)(unsigned long *, void *, void *(*)(void *), void *))dlsym(RTLD_NEXT, "pthread_create");
     if (a == FN_VIDEO_RENDER_THREAD) {
         mask = CORE0;
         nice = -5;                /* match Main (-5) so Engine B 2D never stalls behind Main */
+        role = 1;
     }
     if (fn == flip_thread) {
         mask = CORE0;
         nice = -8;                /* never miss a vsync pan behind Main/2D */
+        role = 2;
     }
     if (a == FN_VIDEO_3D_RENDER_THREAD && helpers_seen++ == 0) {
         mask = CORE0;             /* 11. the first 3D helper (bins 1, 4, 7...) runs next to the emulation */
         nice = 5;                 /* idle-fill on core 0: never preempt flip (-8), Main (-5), or Engine B (-5) */
+        role = 3;
     }
     if (!active || !(t = (struct tramp *)malloc(sizeof(*t))))
         return real(th, attr, fn, arg);
@@ -842,6 +1004,7 @@ int pthread_create(unsigned long *th, void *attr, void *(*fn)(void *), void *arg
     t->arg = arg;
     t->mask = mask;
     t->nice = nice;
+    t->role = role;
     return real(th, attr, tramp_run, t);
 }
 
@@ -1021,6 +1184,9 @@ static void split_finish_rendering(void *v3d)
     if (g_sys) {
         u32 n = batch3d_max;
         CFG(g_sys, CFG_BATCH_3D) = c >= 4 ? n : c == 0 ? 1 : CFG(g_sys, CFG_BATCH_3D) == n ? n : 1;
+        split_n++;
+        if (CFG(g_sys, CFG_BATCH_3D) > 1)
+            split_on++;
     }
 }
 
@@ -1277,6 +1443,828 @@ static void neon3d_setup(void)
             patch(k[i].addr, (void *)k[i].fn);
     }
 }
+
+
+/* ------------------------------------------------------------------ TEST lote 5: 3D polygon cost by type
+   DSFAST_POLYPROF=1: render_polygon_4x is timed per call and summed by polygon_render_flags (flags bits 8-15:
+   1 ALPHA, 2 TEXTURE, 4 COLOR_CONSTANT, 8 W_BUFFER, 0x10 DEPTH_CONSTANT, 0x20 W_CONSTANT, 0x40 SPRITE) and
+   by texture format; result in Emu/NDS/dsfast_polyprof.txt at exit. For studies only. */
+#define FN_RENDER_POLYGON_4X 0x080750b8u
+static int pp_on;
+static u32 rp4_tramp[4] __attribute__((aligned(16)));
+static volatile u32 pp_n[256], pp_us[256], pp_fn[8], pp_fus[8], pp_vn[16], pp_vus[16];
+static volatile u32 pp_px[256], pp_fpx[8], pp_maxy, pp_maxx;
+static void pp_render_polygon_4x(u8 *rt, u8 *poly, u8 *verts, u32 min_y, u32 max_y)
+{
+    u32 fl = *(u32 *)(poly + 8), rf = (fl >> 8) & 0xff, us;
+    s64 t = mono_us();
+    ((void (*)(u8 *, u8 *, u8 *, u32, u32))(void *)rp4_tramp)(rt, poly, verts, min_y, max_y);
+    us = (u32)(mono_us() - t);
+    {   /* pixel estimate: polygon area (shoelace) x the part of its height inside this bin's rows */
+        u32 nv = fl & 15, k, px = 0;
+        unsigned short *v = (unsigned short *)(verts + ((u32)*(unsigned short *)(poly + 0x12) << 4));
+        if (nv >= 3 && nv <= 10) {
+            s32 a = 0, y0 = 1 << 30, y1 = -1, lo, hi;
+            for (k = 0; k < nv; k++) {
+                unsigned short *p0 = v + k * 8, *p1 = v + ((k + 1) % nv) * 8;
+                a += (s32)p0[2] * p1[3] - (s32)p1[2] * p0[3];
+                if (p0[3] < y0) y0 = p0[3];
+                if (p0[3] > y1) y1 = p0[3];
+                if (p0[3] > pp_maxy) pp_maxy = p0[3];
+                if (p0[2] > pp_maxx) pp_maxx = p0[2];
+            }
+            if (a < 0) a = -a;
+            lo = y0 > (s32)min_y ? y0 : (s32)min_y;
+            hi = y1 < (s32)max_y ? y1 : (s32)max_y;
+            if (hi > lo && y1 > y0)
+                px = (u32)((float)a * 0.5f * (float)(hi - lo) / (float)(y1 - y0));
+        }
+        __sync_fetch_and_add(&pp_px[rf], px);
+        if (rf & 2)
+            __sync_fetch_and_add(&pp_fpx[(*(u32 *)poly >> 26) & 7], px);
+    }
+    __sync_fetch_and_add(&pp_n[rf], 1);
+    __sync_fetch_and_add(&pp_us[rf], us);
+    __sync_fetch_and_add(&pp_vn[fl & 15], 1);
+    __sync_fetch_and_add(&pp_vus[fl & 15], us);
+    if (rf & 2) {
+        u32 fmt = (*(u32 *)poly >> 26) & 7;
+        __sync_fetch_and_add(&pp_fn[fmt], 1);
+        __sync_fetch_and_add(&pp_fus[fmt], us);
+    }
+}
+static void polyprof_setup(void)
+{
+    if (!getenv("DSFAST_POLYPROF") || *(u32 *)FN_RENDER_POLYGON_4X != 0xe16d42f4u ||
+        *(u32 *)(FN_RENDER_POLYGON_4X + 4) != 0xe591c008u)
+        return;
+    pp_on = 1;
+    rp4_tramp[0] = *(u32 *)FN_RENDER_POLYGON_4X;          /* strd r4, r5, [sp, #-36]! */
+    rp4_tramp[1] = *(u32 *)(FN_RENDER_POLYGON_4X + 4);    /* ldr r12, [r1, #8] */
+    rp4_tramp[2] = 0xe51ff004;
+    rp4_tramp[3] = FN_RENDER_POLYGON_4X + 8;
+    mprotect((void *)((u32)rp4_tramp & ~4095u), 8192, 7);
+    flush_icache(rp4_tramp, rp4_tramp + 4);
+    patch(FN_RENDER_POLYGON_4X, (void *)pp_render_polygon_4x);
+}
+static void polyprof_write(void)
+{
+    static const char *fmt_name[8] = { "none", "a3i5", "pal4", "pal16", "pal256", "comp4x4", "a5i3", "direct" };
+    u32 i, tn = 0, tus = 0;
+    void *f;
+    if (!pp_on || !(f = log_fopen("/mnt/SDCARD/Emu/NDS/dsfast_polyprof.txt", "w")))
+        return;
+    for (i = 0; i < 256; i++) {
+        tn += pp_n[i];
+        tus += pp_us[i];
+    }
+    log_printf(f, "render_polygon_4x: %u calls, %u ms in all (all 3D threads), %u frames emulated\n", tn, tus / 1000, frames_n);
+    log_printf(f, "vertex coordinates seen: max x %u, max y %u (bin rows min_y..max_y are in the same units)\n", pp_maxx, pp_maxy);
+    log_printf(f, "by render flags (1 ALPHA 2 TEX 4 COLORK 8 WBUF 10 DEPTHK 20 WK 40 SPRITE): flags calls ms us/call kpixels ns/pixel\n");
+    for (i = 0; i < 256; i++)
+        if (pp_n[i])
+            log_printf(f, "  %02x %7u %6u %5u %8u %5u\n", i, pp_n[i], pp_us[i] / 1000, pp_us[i] / pp_n[i], pp_px[i] / 1000,
+                       pp_px[i] ? (u32)((float)pp_us[i] * 1000.0f / (float)pp_px[i]) : 0);
+    log_printf(f, "textured, by texture format: format calls ms us/call\n");
+    for (i = 0; i < 8; i++)
+        if (pp_fn[i])
+            log_printf(f, "  %-8s %7u %6u %5u kpx %8u ns/px %5u\n", fmt_name[i], pp_fn[i], pp_fus[i] / 1000, pp_fus[i] / pp_fn[i],
+                       pp_fpx[i] / 1000, pp_fpx[i] ? (u32)((float)pp_fus[i] * 1000.0f / (float)pp_fpx[i]) : 0);
+    log_printf(f, "by vertex count: n calls ms us/call\n");
+    for (i = 0; i < 16; i++)
+        if (pp_vn[i])
+            log_printf(f, "  %2u %7u %6u %5u\n", i, pp_vn[i], pp_vus[i] / 1000, pp_vus[i] / pp_vn[i]);
+    log_fclose(f);
+}
+
+
+/* ------------------------------------------------------------------ TEST lote 6: own 3D drawing, case 0x0e
+   render_polygon_flush_4x (0x08061f50) draws the pixels render_polygon_setup_4x listed, in ~13 passes over
+   per-pixel buffers. For the most common GTA polygon (flags 0x0e: textured, constant color, W-buffer, not
+   translucent, modulate) this does everything in one pass per row, with the same arithmetic bit for bit:
+   perspective step (float reciprocal + 2 Newton steps, as DraStic), w, u/v, depth test, texture address
+   (clamp/wrap/flip), texel, modulate, alpha test, fog bit, writeback. Other polygons go to the original.
+   DSFAST_FAST3D=1 uses it; DSFAST_FAST3D=2 checks it: computes into a copy of the rows, runs the original
+   and compares the two (result in Emu/NDS/dsfast_fast3d.txt). */
+#include <arm_neon.h>
+#define FN_FLUSH_4X 0x08061f50u
+extern void *memcpy(void *d, const void *s, unsigned int n);
+static int f3d_mode, f3d_timed, f3d_skip, f3d_cases = 1 | 2 | 4 | 8;   /* 0e, 0a, 0f, 0b */
+static volatile u32 f3d_tus, f3d_tpx, f3d_tn, f3d_tov;
+static u32 fl4_tramp[4] __attribute__((aligned(16)));
+static volatile u32 f3d_fast, f3d_other, f3d_vcalls, f3d_vbad, f3d_vrows, f3d_why[8];
+static volatile u32 f3d_aid, f3d_acalls, f3d_abadc, f3d_aw[2], f3d_acnt[2];
+static volatile u32 f3d_log_n, f3d_cbad, f3d_d30, f3d_dother, f3d_badfog, f3d_vfog;
+static s32 f3d_logw[8][2];
+static u32 f3d_log[8][8];
+typedef void (*fl4_fn)(u8 *, u8 *, u8 *, u32, u32, u8 *, u32, u32, u32, u32);
+
+static inline u8 *f3d_v3dx(u8 *rt) { return *(u8 **)(rt + 0x24000) + 0x34d000; }   /* video_3d + 0x100000 + 0x24c000 + 0x1000 */
+
+/* 0: can do it; else reason (for the counters) */
+static int f3d_check(u8 *rt, u8 *poly)
+{
+    u32 attr = *(u32 *)(poly + 4);
+    u8 *tc = *(u8 **)(poly + 0xc);
+    u32 w, h;
+    if ((attr >> 4) & 3)
+        return 1;                                   /* decal / toon / shadow */
+    if (!tc)
+        return 3;
+    w = *(unsigned short *)(tc + 0x24);
+    h = *(unsigned short *)(tc + 0x26);
+    if (!w || !h || (w & (w - 1)) || (h & (h - 1)))
+        return 4;
+    return 0;
+}
+
+/* draws rows 0..height-1 of the listed pixels into color/depth (rows of 512 u32); returns 1 if any pixel passed
+   the alpha test (DraStic then marks the render target as having fog pixels when the polygon has fog) */
+static int f3d_draw_0e(u8 *rt, u8 *edge, u8 *poly, u32 height, u32 *color, u32 *depth)
+{
+    u32 attr = *(u32 *)(poly + 4), pid = ((attr >> 24) & 63) << 24, pa = (attr >> 16) & 31;
+    u32 fogbit = (attr & 0x8000) ? 0x80000000u : 0, eq = attr & 0x4000;
+    u8 *tc = *(u8 **)(poly + 0xc);
+    u32 tw = *(unsigned short *)(tc + 0x24), th = *(unsigned short *)(tc + 0x26);
+    u8 *data = *(u8 **)(tc + 0xc);
+    u32 *pal = *(u32 **)(tc + 0x10), paletted = tc[0x2e];
+    u32 rep = *(unsigned short *)(poly + 2) & 15;
+    u32 sm = (rep & 1) ? ((rep & 4) ? 2 : 1) : 0, tm = (rep & 2) ? ((rep & 8) ? 2 : 1) : 0;   /* 0 clamp 1 wrap 2 flip */
+    u32 cr = (u8)(*(unsigned short *)(edge + 0x420) >> 3), cg = (u8)(*(unsigned short *)(edge + 0x422) >> 3),
+        cb = (u8)(*(unsigned short *)(edge + 0x582) >> 3);
+    u32 aref = *(u32 *)(f3d_v3dx(rt) + 0x44) & 0xff, any = 0, r;
+    u32 emark = *(u32 *)(f3d_v3dx(rt) + 0x40) & 32;   /* edge marking: DraStic sets the top byte of the w of the
+                                                         row's left and right edge pixels to 0x40 */
+    static const float k0[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+    float32x4_t ka = vld1q_f32(k0), kb = vld1q_f32(k0 + 4);
+    for (r = 0; r < height; r++, color += 512, depth += 512) {
+        u32 x0 = *(unsigned short *)(edge + 1408 + r * 4), n = *(unsigned short *)(edge + 1584 + r * 4);
+        s32 w0 = *(s32 *)(edge + r * 4), dw = *(s32 *)(edge + 0xb0 + r * 4);
+        u32 uv0 = *(u32 *)(edge + 704 + r * 4), duv = *(u32 *)(edge + 880 + r * 4);
+        s32 du = (short)duv, dv = (short)(duv >> 16);
+        s32 U0 = ((s32)(short)uv0 << 15) + (du > 0 ? 0x400 : 0), V0 = ((s32)(short)(uv0 >> 16) << 15) + (dv > 0 ? 0x400 : 0);
+        float w0f = (float)w0, dwf = (float)dw;
+        float nw = (float)(s32)(w0 + dw) * (float)(s32)n;
+        float32x4_t den0, den1, num0, num1, d8 = vdupq_n_f32(8.0f * dwf), n8 = vdupq_n_f32(8.0f * w0f);
+        u32 *cp = color + x0, *dp = depth + x0, k;
+        u32 elo = emark ? *(unsigned short *)(edge + 1760 + r * 4) : 0, ehi = emark ? n - *(unsigned short *)(edge + 1762 + r * 4) : n;
+        if (!n)
+            continue;
+        den0 = vmlsq_f32(vdupq_n_f32(nw), ka, vdupq_n_f32(dwf));
+        den1 = vmlsq_f32(vdupq_n_f32(nw), kb, vdupq_n_f32(dwf));
+        num0 = vmulq_f32(ka, vdupq_n_f32(w0f));
+        num1 = vmulq_f32(kb, vdupq_n_f32(w0f));
+        for (k = 0; k < n; k += 8) {
+            float32x4_t e0 = vrecpeq_f32(den0), e1 = vrecpeq_f32(den1);
+            short ts[8];
+            s32 ws[8];
+            u32 j, m = n - k < 8 ? n - k : 8;
+            int16x8_t t;
+            e0 = vmulq_f32(e0, vrecpsq_f32(e0, den0));
+            e1 = vmulq_f32(e1, vrecpsq_f32(e1, den1));
+            e0 = vmulq_f32(e0, vrecpsq_f32(e0, den0));
+            e1 = vmulq_f32(e1, vrecpsq_f32(e1, den1));
+            t = vcombine_s16(vmovn_s32(vcvtq_n_s32_f32(vmulq_f32(num0, e0), 15)),
+                             vmovn_s32(vcvtq_n_s32_f32(vmulq_f32(num1, e1), 15)));
+            vst1q_s16(ts, t);
+            den0 = vsubq_f32(den0, d8);
+            den1 = vsubq_f32(den1, d8);
+            num0 = vaddq_f32(num0, n8);
+            num1 = vaddq_f32(num1, n8);
+            for (j = 0; j < m; j++) {
+                s32 tt = ts[j], w = w0 + (s32)(((s64)dw * tt) >> 15);
+                u32 db = dp[j] & 0xffffff, pass, s, tv, tex, a, out;
+                s32 u, v;
+                if (eq) {
+                    s32 d = w - (s32)db;
+                    if (d < 0) d = -d;
+                    pass = (u32)d < 0x100;
+                } else
+                    pass = db > (u32)w;
+                if (!pass)
+                    continue;
+                u = (short)((u32)(U0 + du * tt) >> 16) >> 3;
+                v = (short)((u32)(V0 + dv * tt) >> 16) >> 3;
+                if (sm == 0)
+                    s = (u32)(u < 0 ? 0 : u > (s32)tw - 1 ? (s32)tw - 1 : u);
+                else if (sm == 1)
+                    s = (u32)u & (tw - 1);
+                else
+                    s = ((u32)u & tw ? ~(u32)u : (u32)u) & (tw - 1);
+                if (tm == 0)
+                    tv = (u32)(v < 0 ? 0 : v > (s32)th - 1 ? (s32)th - 1 : v);
+                else if (tm == 1)
+                    tv = (u32)v & (th - 1);
+                else
+                    tv = ((u32)v & th ? ~(u32)v : (u32)v) & (th - 1);
+                s += tv * tw;
+                tex = paletted ? pal[data[s]] : ((u32 *)data)[s];
+                a = (u8)((pa + (tex >> 24) + pa * (tex >> 24)) >> 5);
+                if (a <= aref)
+                    continue;
+                {
+                    u32 t0 = tex & 0xff, t1 = (tex >> 8) & 0xff, t2 = (tex >> 16) & 0xff;
+                    out = (u8)((cr + t0 + cr * t0) >> 6) | (u32)(u8)((cg + t1 + cg * t1) >> 6) << 8 |
+                          (u32)(u8)((cb + t2 + cb * t2) >> 6) << 16 | a << 24 | fogbit;
+                }
+                any = 1;
+                cp[j] = out;
+                dp[j] = (k + j < elo || k + j >= ehi ? ((u32)w & 0xffffff) | 0x40000000u : (u32)w) | pid;
+            }
+            cp += 8;
+            dp += 8;
+        }
+    }
+    return any;
+}
+
+
+/* same as f3d_draw_0e, 8 pixels at a time in NEON registers (texels fetched one by one) */
+static int f3d_draw_0e_neon(u8 *rt, u8 *edge, u8 *poly, u32 height, u32 *color, u32 *depth)
+{
+    u32 attr = *(u32 *)(poly + 4), pid = ((attr >> 24) & 63) << 24, pa = (attr >> 16) & 31;
+    u32 fog = attr & 0x8000, eq = attr & 0x4000;
+    u8 *tc = *(u8 **)(poly + 0xc);
+    u32 tw = *(unsigned short *)(tc + 0x24), th = *(unsigned short *)(tc + 0x26);
+    u8 *data = *(u8 **)(tc + 0xc);
+    u32 *pal = *(u32 **)(tc + 0x10), paletted = tc[0x2e];
+    u32 rep = *(unsigned short *)(poly + 2) & 15;
+    u32 sm = (rep & 1) ? ((rep & 4) ? 2 : 1) : 0, tm = (rep & 2) ? ((rep & 8) ? 2 : 1) : 0;
+    u8 aref = (u8)*(u32 *)(f3d_v3dx(rt) + 0x44);
+    u32 emark = *(u32 *)(f3d_v3dx(rt) + 0x40) & 32;
+    uint32x4_t m24w = vdupq_n_u32(0xffffff), e40 = vdupq_n_u32(0x40000000);
+    uint32x4_t anyv = vdupq_n_u32(0), pidv = vdupq_n_u32(pid), m24 = vdupq_n_u32(0xffffff), c100 = vdupq_n_u32(0x100);
+    uint8x8_t vcr = vdup_n_u8((u8)(*(unsigned short *)(edge + 0x420) >> 3)), vcg = vdup_n_u8((u8)(*(unsigned short *)(edge + 0x422) >> 3)),
+              vcb = vdup_n_u8((u8)(*(unsigned short *)(edge + 0x582) >> 3)), vpa = vdup_n_u8((u8)pa), varef = vdup_n_u8(aref),
+              vfog = vdup_n_u8(fog ? 0x80 : 0);
+    int16x8_t wm1 = vdupq_n_s16((short)(tw - 1)), hm1 = vdupq_n_s16((short)(th - 1)), wb = vdupq_n_s16((short)tw),
+              hb = vdupq_n_s16((short)th), z16 = vdupq_n_s16(0);
+    uint16x4_t vtw = vdup_n_u16((unsigned short)tw);
+    static const float k0[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+    static const u32 lanes[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+    float32x4_t ka = vld1q_f32(k0), kb = vld1q_f32(k0 + 4);
+    uint32x4_t la = vld1q_u32(lanes), lb = vld1q_u32(lanes + 4);
+    u32 r;
+    for (r = 0; r < height; r++, color += 512, depth += 512) {
+        u32 x0 = *(unsigned short *)(edge + 1408 + r * 4), n = *(unsigned short *)(edge + 1584 + r * 4);
+        s32 w0 = *(s32 *)(edge + r * 4), dw = *(s32 *)(edge + 0xb0 + r * 4);
+        u32 uv0 = *(u32 *)(edge + 704 + r * 4), duv = *(u32 *)(edge + 880 + r * 4);
+        s32 du = (short)duv, dv = (short)(duv >> 16);
+        s32 U0 = ((s32)(short)uv0 << 15) + (du > 0 ? 0x400 : 0), V0 = ((s32)(short)(uv0 >> 16) << 15) + (dv > 0 ? 0x400 : 0);
+        float w0f = (float)w0, dwf = (float)dw, nw = (float)(s32)(w0 + dw) * (float)(s32)n;
+        float32x4_t den0, den1, num0, num1, d8 = vdupq_n_f32(8.0f * dwf), n8 = vdupq_n_f32(8.0f * w0f);
+        int32x2_t vdw = vdup_n_s32(dw);
+        int32x4_t vw0 = vdupq_n_s32(w0), vU0 = vdupq_n_s32(U0), vV0 = vdupq_n_s32(V0);
+        int16x4_t vdu = vdup_n_s16((short)du), vdv = vdup_n_s16((short)dv);
+        uint32x4_t left = vdupq_n_u32(n), kv0 = la, kv1 = lb,
+                   vlo = vdupq_n_u32(emark ? *(unsigned short *)(edge + 1760 + r * 4) : 0),
+                   vhi = vdupq_n_u32(emark ? n - *(unsigned short *)(edge + 1762 + r * 4) : 0x10000);
+        u32 *cp = color + x0, *dp = depth + x0, k;
+        if (!n)
+            continue;
+        den0 = vmlsq_f32(vdupq_n_f32(nw), ka, vdupq_n_f32(dwf));
+        den1 = vmlsq_f32(vdupq_n_f32(nw), kb, vdupq_n_f32(dwf));
+        num0 = vmulq_f32(ka, vdupq_n_f32(w0f));
+        num1 = vmulq_f32(kb, vdupq_n_f32(w0f));
+        for (k = 0; k < n; k += 8, cp += 8, dp += 8) {
+            float32x4_t e0 = vrecpeq_f32(den0), e1 = vrecpeq_f32(den1);
+            int16x4_t t0, t1;
+            int32x4_t w_0, w_1;
+            uint32x4_t db0 = vld1q_u32(dp), db1 = vld1q_u32(dp + 4), m0, m1, z0, z1;
+            uint32x2_t mm;
+            e0 = vmulq_f32(e0, vrecpsq_f32(e0, den0));
+            e1 = vmulq_f32(e1, vrecpsq_f32(e1, den1));
+            e0 = vmulq_f32(e0, vrecpsq_f32(e0, den0));
+            e1 = vmulq_f32(e1, vrecpsq_f32(e1, den1));
+            t0 = vmovn_s32(vcvtq_n_s32_f32(vmulq_f32(num0, e0), 15));
+            t1 = vmovn_s32(vcvtq_n_s32_f32(vmulq_f32(num1, e1), 15));
+            den0 = vsubq_f32(den0, d8);
+            den1 = vsubq_f32(den1, d8);
+            num0 = vaddq_f32(num0, n8);
+            num1 = vaddq_f32(num1, n8);
+            {   /* w = w0 + (dw * t >> 15), 64-bit product as DraStic */
+                int32x4_t ta = vmovl_s16(t0), tb = vmovl_s16(t1);
+                w_0 = vaddq_s32(vcombine_s32(vshrn_n_s64(vmull_s32(vdw, vget_low_s32(ta)), 15),
+                                             vshrn_n_s64(vmull_s32(vdw, vget_high_s32(ta)), 15)), vw0);
+                w_1 = vaddq_s32(vcombine_s32(vshrn_n_s64(vmull_s32(vdw, vget_low_s32(tb)), 15),
+                                             vshrn_n_s64(vmull_s32(vdw, vget_high_s32(tb)), 15)), vw0);
+            }
+            z0 = vandq_u32(db0, m24);
+            z1 = vandq_u32(db1, m24);
+            if (eq) {
+                m0 = vcltq_u32(vreinterpretq_u32_s32(vabsq_s32(vsubq_s32(w_0, vreinterpretq_s32_u32(z0)))), c100);
+                m1 = vcltq_u32(vreinterpretq_u32_s32(vabsq_s32(vsubq_s32(w_1, vreinterpretq_s32_u32(z1)))), c100);
+            } else {
+                m0 = vcgtq_u32(z0, vreinterpretq_u32_s32(w_0));
+                m1 = vcgtq_u32(z1, vreinterpretq_u32_s32(w_1));
+            }
+            m0 = vandq_u32(m0, vcltq_u32(la, left));
+            m1 = vandq_u32(m1, vcltq_u32(lb, left));
+            left = vsubq_u32(left, vdupq_n_u32(8));
+            {   /* edge pixels of the row: w top byte = 0x40 */
+                uint32x4_t ed0 = vorrq_u32(vcltq_u32(kv0, vlo), vcgeq_u32(kv0, vhi)), ed1 = vorrq_u32(vcltq_u32(kv1, vlo), vcgeq_u32(kv1, vhi));
+                w_0 = vreinterpretq_s32_u32(vbslq_u32(ed0, vorrq_u32(vandq_u32(vreinterpretq_u32_s32(w_0), m24w), e40), vreinterpretq_u32_s32(w_0)));
+                w_1 = vreinterpretq_s32_u32(vbslq_u32(ed1, vorrq_u32(vandq_u32(vreinterpretq_u32_s32(w_1), m24w), e40), vreinterpretq_u32_s32(w_1)));
+                kv0 = vaddq_u32(kv0, vdupq_n_u32(8));
+                kv1 = vaddq_u32(kv1, vdupq_n_u32(8));
+            }
+            mm = vorr_u32(vget_low_u32(vorrq_u32(m0, m1)), vget_high_u32(vorrq_u32(m0, m1)));
+            if (!(vget_lane_u32(mm, 0) | vget_lane_u32(mm, 1)))
+                continue;
+            {
+                int16x8_t u, v, s, tt;
+                uint32x4_t a0, a1, c0, c1;
+                u32 ad[8] __attribute__((aligned(16))), tx[8] __attribute__((aligned(16)));
+                uint8x8x4_t T;
+                uint8x8_t ao, am;
+                uint16x8_t am16;
+                u = vcombine_s16(vshr_n_s16(vshrn_n_s32(vmlal_s16(vU0, vdu, t0), 16), 3),
+                                 vshr_n_s16(vshrn_n_s32(vmlal_s16(vU0, vdu, t1), 16), 3));
+                v = vcombine_s16(vshr_n_s16(vshrn_n_s32(vmlal_s16(vV0, vdv, t0), 16), 3),
+                                 vshr_n_s16(vshrn_n_s32(vmlal_s16(vV0, vdv, t1), 16), 3));
+                if (sm == 0)
+                    s = vminq_s16(vmaxq_s16(u, z16), wm1);
+                else if (sm == 1)
+                    s = vandq_s16(u, wm1);
+                else
+                    s = vandq_s16(veorq_s16(u, vreinterpretq_s16_u16(vtstq_s16(u, wb))), wm1);
+                if (tm == 0)
+                    tt = vminq_s16(vmaxq_s16(v, z16), hm1);
+                else if (tm == 1)
+                    tt = vandq_s16(v, hm1);
+                else
+                    tt = vandq_s16(veorq_s16(v, vreinterpretq_s16_u16(vtstq_s16(v, hb))), hm1);
+                a0 = vmlal_u16(vmovl_u16(vreinterpret_u16_s16(vget_low_s16(s))), vreinterpret_u16_s16(vget_low_s16(tt)), vtw);
+                a1 = vmlal_u16(vmovl_u16(vreinterpret_u16_s16(vget_high_s16(s))), vreinterpret_u16_s16(vget_high_s16(tt)), vtw);
+                vst1q_u32(ad, a0);
+                vst1q_u32(ad + 4, a1);
+                if (paletted) {
+                    tx[0] = pal[data[ad[0]]]; tx[1] = pal[data[ad[1]]]; tx[2] = pal[data[ad[2]]]; tx[3] = pal[data[ad[3]]];
+                    tx[4] = pal[data[ad[4]]]; tx[5] = pal[data[ad[5]]]; tx[6] = pal[data[ad[6]]]; tx[7] = pal[data[ad[7]]];
+                } else {
+                    u32 *d32 = (u32 *)data;
+                    tx[0] = d32[ad[0]]; tx[1] = d32[ad[1]]; tx[2] = d32[ad[2]]; tx[3] = d32[ad[3]];
+                    tx[4] = d32[ad[4]]; tx[5] = d32[ad[5]]; tx[6] = d32[ad[6]]; tx[7] = d32[ad[7]];
+                }
+                T = vld4_u8((u8 *)tx);
+                T.val[0] = vshrn_n_u16(vmlal_u8(vaddl_u8(vcr, T.val[0]), vcr, T.val[0]), 6);
+                T.val[1] = vshrn_n_u16(vmlal_u8(vaddl_u8(vcg, T.val[1]), vcg, T.val[1]), 6);
+                T.val[2] = vshrn_n_u16(vmlal_u8(vaddl_u8(vcb, T.val[2]), vcb, T.val[2]), 6);
+                ao = vshrn_n_u16(vmlal_u8(vaddl_u8(vpa, T.val[3]), vpa, T.val[3]), 5);
+                am = vcgt_u8(ao, varef);
+                T.val[3] = vorr_u8(ao, vfog);
+                vst4_u8((u8 *)tx, T);
+                am16 = vreinterpretq_u16_s16(vmovl_s8(vreinterpret_s8_u8(am)));
+                m0 = vandq_u32(m0, vreinterpretq_u32_s32(vmovl_s16(vreinterpret_s16_u16(vget_low_u16(am16)))));
+                m1 = vandq_u32(m1, vreinterpretq_u32_s32(vmovl_s16(vreinterpret_s16_u16(vget_high_u16(am16)))));
+                anyv = vorrq_u32(anyv, vorrq_u32(m0, m1));
+                c0 = vld1q_u32(cp);
+                c1 = vld1q_u32(cp + 4);
+                vst1q_u32(cp, vbslq_u32(m0, vld1q_u32(tx), c0));
+                vst1q_u32(cp + 4, vbslq_u32(m1, vld1q_u32(tx + 4), c1));
+                vst1q_u32(dp, vbslq_u32(m0, vorrq_u32(vreinterpretq_u32_s32(w_0), pidv), db0));
+                vst1q_u32(dp + 4, vbslq_u32(m1, vorrq_u32(vreinterpretq_u32_s32(w_1), pidv), db1));
+            }
+        }
+    }
+    return (vgetq_lane_u32(anyv, 0) | vgetq_lane_u32(anyv, 1) | vgetq_lane_u32(anyv, 2) | vgetq_lane_u32(anyv, 3)) != 0;
+}
+
+
+#include "f3d_v5.h"
+
+
+/* mode 8: record the 0x0a/0x0e calls (inputs, rows before, DraStic's rows after) for the offline bench */
+extern unsigned int log_fwrite(const void *p, unsigned int sz, unsigned int n, void *f) __asm__("fwrite");
+static void *f3d_df;
+static volatile int f3d_dlock;
+static u32 f3d_dleft, f3d_dbytes, f3d_dn;
+static void f3d_dump_call(u8 *rt, u8 *edge, u8 *poly, u32 scan, u32 height, u8 *buf, u32 pixels, u32 flags, u32 a8, u32 a9)
+{
+    u8 *tc = *(u8 **)(poly + 0xc);
+    u32 tw = *(unsigned short *)(tc + 0x24), th = *(unsigned short *)(tc + 0x26), pald = tc[0x2e];
+    u32 tb = pald ? tw * th : tw * th * 4, pb = pald ? 1024 : 0, rb = height << 11;
+    u32 hd[16];
+    u8 *v = f3d_v3dx(rt);
+    while (__sync_lock_test_and_set(&f3d_dlock, 1))
+        ;
+    if (!f3d_df || !f3d_dleft || tb > 65536 || f3d_dbytes > (64u << 20)) {
+        __sync_lock_release(&f3d_dlock);
+        ((fl4_fn)(void *)fl4_tramp)(rt, edge, poly, scan, height, buf, pixels, flags, a8, a9);
+        return;
+    }
+    hd[0] = 0x33443346; hd[1] = flags; hd[2] = height; hd[3] = scan; hd[4] = *(u32 *)(poly + 4); hd[5] = *(unsigned short *)(poly + 2);
+    hd[6] = tw; hd[7] = th; hd[8] = pald; hd[9] = *(u32 *)(v + 0x40); hd[10] = *(u32 *)(v + 0x44); hd[11] = tb; hd[12] = pb;
+    hd[13] = *(u32 *)(rt + 0x24000 + 0xc); hd[14] = 0; hd[15] = 0;
+    log_fwrite(hd, 4, 16, f3d_df);
+    log_fwrite(edge, 1, 2048, f3d_df);
+    log_fwrite(*(u8 **)(tc + 0xc), 1, tb, f3d_df);
+    if (pb) log_fwrite(*(u8 **)(tc + 0x10), 1, pb, f3d_df);
+    log_fwrite(rt + (scan << 11), 1, rb, f3d_df);
+    log_fwrite(rt + 0x10000 + (scan << 11), 1, rb, f3d_df);
+    ((fl4_fn)(void *)fl4_tramp)(rt, edge, poly, scan, height, buf, pixels, flags, a8, a9);
+    log_fwrite(rt + (scan << 11), 1, rb, f3d_df);
+    log_fwrite(rt + 0x10000 + (scan << 11), 1, rb, f3d_df);
+    hd[0] = *(u32 *)(rt + 0x24000 + 0xc);
+    log_fwrite(hd, 4, 1, f3d_df);
+    f3d_dbytes += 64 + 2048 + tb + pb + rb * 4 + 4;
+    f3d_dn++;
+    if (!--f3d_dleft) {
+        log_fclose(f3d_df);
+        f3d_df = 0;
+    }
+    __sync_lock_release(&f3d_dlock);
+}
+
+static void f3d_flush(u8 *rt, u8 *edge, u8 *poly, u32 scan, u32 height, u8 *buf, u32 pixels, u32 flags, u32 a8, u32 a9)
+{
+    u32 f5 = flags & 31;
+    int why, cs = f5 == 0x0e ? 1 : f5 == 0x0a ? 2 : f5 == 0x0f ? 4 : f5 == 0x0b ? 8 : 0, gour = (cs & 10) != 0, alpha = (cs & 12) != 0;
+    u8 *ids = rt + 0x20000 + (scan << 9);
+    if (!(cs & f3d_cases))
+        cs = 0;
+    if (f3d_timed && cs && !f3d_check(rt, poly)) {   /* modes 5/6/7: time the flush alone */
+        s64 t0 = mono_us();
+        u32 r, px = 0;
+        for (r = 0; r < height; r++)
+            px += *(unsigned short *)(edge + 1584 + r * 4);
+        if (f3d_mode >= 6) {
+            if ((f3d_mode == 6 ? f3d_draw_v5(rt, edge, poly, height, (u32 *)(rt + (scan << 11)), (u32 *)(rt + 0x10000 + (scan << 11)), gour, alpha, ids)
+                               : f3d_draw_0e_neon(rt, edge, poly, height, (u32 *)(rt + (scan << 11)), (u32 *)(rt + 0x10000 + (scan << 11)))) &&
+                (*(u32 *)(poly + 4) & 0x8000))
+                *(u32 *)(rt + 0x24000 + 0xc) = 1;
+        } else
+            ((fl4_fn)(void *)fl4_tramp)(rt, edge, poly, scan, height, buf, pixels, flags, a8, a9);
+        __sync_fetch_and_add(&f3d_tus, (u32)(mono_us() - t0));
+        if (!(f3d_tn & 63)) {   /* cost of the stopwatch itself, sampled: 64 empty pairs every 64 calls */
+            s64 a = mono_us(); int q;
+            for (q = 0; q < 64; q++) (void)mono_us();
+            __sync_fetch_and_add(&f3d_tov, (u32)(mono_us() - a));
+        }
+        __sync_fetch_and_add(&f3d_tpx, px);
+        __sync_fetch_and_add(&f3d_tn, 1);
+        return;
+    }
+    if (f3d_mode == 8) {
+        if (cs && !f3d_check(rt, poly))
+            f3d_dump_call(rt, edge, poly, scan, height, buf, pixels, flags, a8, a9);
+        else
+            ((fl4_fn)(void *)fl4_tramp)(rt, edge, poly, scan, height, buf, pixels, flags, a8, a9);
+        return;
+    }
+    if (!cs || (why = f3d_check(rt, poly))) {
+        if (cs)
+            f3d_why[why & 7]++;
+        else
+            f3d_other++;
+        ((fl4_fn)(void *)fl4_tramp)(rt, edge, poly, scan, height, buf, pixels, flags, a8, a9);
+        return;
+    }
+    if (f3d_mode == 1 || f3d_mode == 3) {
+        if ((f3d_mode == 3 ? f3d_draw_v5(rt, edge, poly, height, (u32 *)(rt + (scan << 11)), (u32 *)(rt + 0x10000 + (scan << 11)), gour, alpha, ids)
+                           : f3d_draw_0e(rt, edge, poly, height, (u32 *)(rt + (scan << 11)), (u32 *)(rt + 0x10000 + (scan << 11)))) &&
+            (*(u32 *)(poly + 4) & 0x8000))
+            *(u32 *)(rt + 0x24000 + 0xc) = 1;
+        f3d_fast++;
+        if (alpha) f3d_acnt[(flags & 31) == 0x0b]++;
+        return;
+    }
+    {   /* check: ours into a copy of the rows, then the original, then compare whole rows */
+        u32 bytes = height << 11, i, bad = 0;
+        u32 *c = (u32 *)malloc(bytes * 2 + (height << 9) + 64), *d, *rc = (u32 *)(rt + (scan << 11)), *rd = (u32 *)(rt + 0x10000 + (scan << 11));
+        u8 *ic;
+        if (!c) {
+            ((fl4_fn)(void *)fl4_tramp)(rt, edge, poly, scan, height, buf, pixels, flags, a8, a9);
+            return;
+        }
+        d = c + (bytes >> 2);
+        ic = (u8 *)(d + (bytes >> 2));
+        memcpy(c, rc, bytes);
+        memcpy(d, rd, bytes);
+        memcpy(ic, ids, height << 9);
+        if (f3d_mode == 4)
+            f3d_draw_v5(rt, edge, poly, height, c, d, gour, alpha, ic);
+        else
+            f3d_draw_0e(rt, edge, poly, height, c, d);
+        ((fl4_fn)(void *)fl4_tramp)(rt, edge, poly, scan, height, buf, pixels, flags, a8, a9);
+        for (i = 0; i < (bytes >> 2); i++)
+            if (c[i] != rc[i] || d[i] != rd[i]) {
+                if (c[i] != rc[i]) f3d_cbad++;
+                else if ((d[i] ^ rd[i]) == 0x40000000u) f3d_d30++;
+                else f3d_dother++;
+                if (*(u32 *)(poly + 4) & 0x8000) f3d_badfog++;
+                u32 n = __sync_fetch_and_add(&f3d_log_n, 1);
+                bad++;
+                if (n < 8) {
+                    u32 *L = f3d_log[n];
+                    L[0] = i >> 9; L[1] = i & 511; L[2] = rc[i]; L[3] = c[i]; L[4] = rd[i]; L[5] = d[i];
+                    L[6] = *(u32 *)(poly + 4); L[7] = *(u32 *)poly;
+                    f3d_logw[n][0] = *(s32 *)(edge + (i >> 9) * 4); f3d_logw[n][1] = *(s32 *)(edge + 0xb0 + (i >> 9) * 4);
+                }
+            }
+        if (alpha) {
+            u32 ib = 0;
+            for (i = 0; i < (height << 9); i++)
+                ib += ic[i] != ids[i];
+            __sync_fetch_and_add(&f3d_aid, ib);
+            __sync_fetch_and_add(&f3d_acalls, 1);
+            if (bad + ib) __sync_fetch_and_add(&f3d_abadc, 1);
+            __sync_fetch_and_add(&f3d_aw[(flags & 31) == 0x0b], bad);
+        }
+        __sync_fetch_and_add(&f3d_vcalls, 1);
+        if (*(u32 *)(poly + 4) & 0x8000) __sync_fetch_and_add(&f3d_vfog, 1);
+        __sync_fetch_and_add(&f3d_vrows, height);
+        if (bad)
+            __sync_fetch_and_add(&f3d_vbad, bad);
+        free(c);
+    }
+}
+
+
+
+/* ------------------------------------------------------------------ 19. vertex lighting in NEON
+   geometry_transform_vertexes (0x0807d72c), loop 0x0807d870-0x0807da68: for each vertex normal (10.10.10),
+   normal x direction matrix (64-bit products, >> 12), then per enabled light: diffuse = max(L.N, 0),
+   specular from H.N (squared, or the specular table), colors accumulated in 32 bits, >> 14 clamped to 31,
+   stored as BGR555 halfwords at sp + 108. Here 4 vertices at a time, same arithmetic bit for bit.
+   DSFAST_GLIGHT=0 off, 2 = check against DraStic's loop (count in the log); default on. */
+#define GL_LOOP 0x0807d870u
+#define GL_AFTER 0x0807da6cu
+static int gl_mode = 1;
+static u32 gl_orig[(GL_AFTER - GL_LOOP) / 4 + 2] __attribute__((aligned(16)));
+static unsigned short gl_mine[80];
+static void gl_light(u8 *sp, unsigned short *out)
+{
+    u8 *g = *(u8 **)(sp + 0x10), *g9 = g + 0x9000;
+    s32 *m = *(s32 **)(g9 + 0xa3c);
+    u32 n = (u32)(*(u32 **)(sp + 0x44) - (u32 *)(g + 808)), mask = sp[0x1c], i, l;
+    u32 *nrm = (u32 *)(g + 812);
+    s32 *L = (s32 *)(g + 0x96b4);
+    unsigned short *lc = (unsigned short *)(g + 0x9714);
+    u8 *tab = g + 0x9890, usetab = g9[0xa96];
+    uint32x4_t b0 = vdupq_n_u32(*(u32 *)(sp + 0x48)), b1 = vdupq_n_u32(*(u32 *)(sp + 0x4c)), b2 = vdupq_n_u32(*(u32 *)(sp + 0x50)),
+               c31 = vdupq_n_u32(31);
+    int32x4_t z = vdupq_n_s32(0);
+    for (i = 0; i < n; i += 4) {
+        int32x4_t v = vreinterpretq_s32_u32(vld1q_u32(nrm + i)), nx, ny, nz, X, Y, Zv;
+        int32x2_t nxl, nxh, nyl, nyh, nzl, nzh;
+        uint32x4_t ar = b0, ag = b1, ab = b2, o;
+        unsigned short tmp[4];
+        nx = vshrq_n_s32(vshlq_n_s32(v, 22), 22);
+        ny = vshrq_n_s32(vshlq_n_s32(v, 12), 22);
+        nz = vshrq_n_s32(vshlq_n_s32(v, 2), 22);
+        nxl = vget_low_s32(nx); nxh = vget_high_s32(nx); nyl = vget_low_s32(ny); nyh = vget_high_s32(ny);
+        nzl = vget_low_s32(nz); nzh = vget_high_s32(nz);
+#define GLROW(a, b, c) vcombine_s32(vshrn_n_s64(vmlal_n_s32(vmlal_n_s32(vmull_n_s32(nxl, m[a]), nyl, m[b]), nzl, m[c]), 12), \
+                                    vshrn_n_s64(vmlal_n_s32(vmlal_n_s32(vmull_n_s32(nxh, m[a]), nyh, m[b]), nzh, m[c]), 12))
+        X = GLROW(0, 4, 8);
+        Y = GLROW(1, 5, 9);
+        Zv = GLROW(2, 6, 10);
+        for (l = 0; l < 4; l++) {
+            s32 *Ll = L + 3 * l;
+            unsigned short *cl = lc + 3 * l;
+            int32x4_t d, sp4, sq, spec;
+            uint32x4_t neg;
+            if (!((mask >> l) & 1))
+                continue;
+            d = vaddq_s32(vaddq_s32(vshrq_n_s32(vmulq_n_s32(Y, Ll[1]), 9), vshrq_n_s32(vmulq_n_s32(X, Ll[0]), 9)), vshrq_n_s32(vmulq_n_s32(Zv, Ll[2]), 9));
+            d = vmaxq_s32(d, z);
+            sp4 = vaddq_s32(vaddq_s32(vshrq_n_s32(vmulq_n_s32(Y, Ll[13]), 9), vshrq_n_s32(vmulq_n_s32(X, Ll[12]), 9)), vshrq_n_s32(vmulq_n_s32(Zv, Ll[14]), 9));
+            neg = vcltq_s32(sp4, z);
+            sq = vmulq_s32(sp4, sp4);
+            if (usetab) {
+                int32x4_t idx = vbicq_s32(vminq_s32(vshrq_n_s32(sq, 11), vdupq_n_s32(127)), vreinterpretq_s32_u32(neg));
+                s32 t[4] __attribute__((aligned(16)));
+                vst1q_s32(t, idx);
+                t[0] = tab[t[0]] << 1; t[1] = tab[t[1]] << 1; t[2] = tab[t[2]] << 1; t[3] = tab[t[3]] << 1;
+                spec = vld1q_s32(t);
+            } else
+                spec = vbicq_s32(vshrq_n_s32(sq, 9), vreinterpretq_s32_u32(neg));
+            ar = vmlaq_n_u32(vmlaq_n_u32(ar, vreinterpretq_u32_s32(d), cl[0]), vreinterpretq_u32_s32(spec), cl[12]);
+            ag = vmlaq_n_u32(vmlaq_n_u32(ag, vreinterpretq_u32_s32(d), cl[1]), vreinterpretq_u32_s32(spec), cl[13]);
+            ab = vmlaq_n_u32(vmlaq_n_u32(ab, vreinterpretq_u32_s32(d), cl[2]), vreinterpretq_u32_s32(spec), cl[14]);
+        }
+        o = vorrq_u32(vorrq_u32(vminq_u32(vshrq_n_u32(ar, 14), c31), vshlq_n_u32(vminq_u32(vshrq_n_u32(ag, 14), c31), 5)),
+                      vshlq_n_u32(vminq_u32(vshrq_n_u32(ab, 14), c31), 10));
+        if (i + 4 <= n)
+            vst1_u16(out + i, vmovn_u32(o));
+        else {
+            u32 k;
+            vst1_u16(tmp, vmovn_u32(o));
+            for (k = 0; i + k < n; k++)
+                out[i + k] = tmp[k];
+        }
+    }
+}
+__attribute__((used)) static void gl_c(u8 *sp)
+{
+    gl_light(sp, (unsigned short *)(sp + 108));
+}
+__attribute__((used)) static void *gl_c_pre(u8 *sp)
+{
+    gl_light(sp, gl_mine);
+    return gl_orig;
+}
+__attribute__((used)) static void gl_c_cmp(u8 *sp)
+{
+    u8 *g = *(u8 **)(sp + 0x10);
+    u32 n = (u32)(*(u32 **)(sp + 0x44) - (u32 *)(g + 808)), i, b = 0;
+    unsigned short *o = (unsigned short *)(sp + 108);
+    for (i = 0; i < n; i++)
+        b += o[i] != gl_mine[i];
+    gl_calls++;
+    gl_verts += n;
+    if (b) { gl_bad++; gl_badv += b; }
+}
+/* the patched loop start jumps here (sp = DraStic's frame); r4-r11 are kept by the C calls, and DraStic's
+   code after the loop sets every register before reading it */
+__asm__(".text\n.arm\n.align 2\n"
+        "gl_stub:\n  mov r0, sp\n  bl gl_c\n  ldr pc, =0x0807da6c\n.ltorg\n"
+        "gl_stub_chk:\n  mov r0, sp\n  bl gl_c_pre\n  bx r0\n"
+        "gl_stub_cmp:\n  mov r0, sp\n  bl gl_c_cmp\n  ldr pc, =0x0807da6c\n.ltorg\n");
+extern char gl_stub[], gl_stub_chk[], gl_stub_cmp[];
+static void gl_setup(void)
+{
+    char *e = getenv("DSFAST_GLIGHT");
+    u32 *p = (u32 *)GL_LOOP, k, nw = (GL_AFTER - GL_LOOP) / 4;
+    if (e)
+        gl_mode = e[0] - '0';
+    if (gl_mode < 1 || gl_mode > 2)
+        return;
+    /* the loop as in DraStic 2.5.x: ldr r3,[sp,#0x14] ... bne 0x807d870 */
+    if (*(u32 *)(GL_LOOP) != 0xe59d3014u || *(u32 *)(GL_AFTER - 4) != 0x1affff80u) {
+        gl_mode = -1;
+        return;
+    }
+    if (gl_mode == 2) {   /* a copy of the original loop (all its branches are inside it), then the compare */
+        for (k = 0; k < nw; k++)
+            gl_orig[k] = p[k];
+        gl_orig[nw] = 0xe51ff004;
+        gl_orig[nw + 1] = (u32)gl_stub_cmp;
+        mprotect((void *)((u32)gl_orig & ~4095u), 8192, 7);
+        flush_icache(gl_orig, gl_orig + nw + 2);
+        patch(GL_LOOP, gl_stub_chk);
+    } else
+        patch(GL_LOOP, gl_stub);
+}
+
+/* ------------------------------------------------------------------ sampling profiler (DSFAST_SAMPLE=1) */
+/* SIGPROF (process CPU time): each tick records pc, lr and thread id of the running thread; written at exit */
+extern int sigaction(int sig, const void *act, void *old);
+extern int setitimer(int which, const void *nv, void *ov);
+extern int sigaltstack(const void *ss, void *old);
+extern long read(int fd, void *buf, unsigned long n);
+extern long write(int fd, const void *buf, unsigned long n);
+#define SAMPMAX 200000
+static u32 samp[SAMPMAX][3];
+static volatile u32 samp_n;
+static int samp_on;
+static void samp_h(int sig, void *si, void *uc)
+{
+    u32 *g = (u32 *)uc, i = __sync_fetch_and_add(&samp_n, 1);
+    register long r0 __asm__("r0");
+    register long r7 __asm__("r7") = 224;   /* gettid */
+    (void)sig; (void)si;
+    __asm__ volatile("svc #0" : "=r"(r0) : "r"(r7) : "memory");
+    if (i < SAMPMAX) {
+        samp[i][0] = g[23];
+        samp[i][1] = g[22];
+        samp[i][2] = (u32)r0;
+    }
+}
+static void samp_setup(void)
+{
+    struct { void *h; u32 mask[32]; int flags; void *restorer; } sa;
+    long it[4] = { 0, 1000, 0, 1000 };
+    if (!getenv("DSFAST_SAMPLE"))
+        return;
+    __builtin_memset(&sa, 0, sizeof sa);
+    sa.h = (void *)samp_h;
+    sa.flags = 4 | 0x10000000 | 0x08000000;   /* SA_SIGINFO | SA_RESTART | SA_ONSTACK */
+    (void)it;
+    if (sigaction(27, &sa, 0) == 0)
+        samp_on = 1;   /* the timer starts at frame 300 (samp_frame), after the game and the save state are loaded:
+                          a SIGPROF during the loading can cut a read() short */
+}
+static void samp_frame(void)
+{
+    long it[4] = { 0, 1000, 0, 1000 };
+    if (samp_on == 1 && frames_n == 300) {
+        /* the dynarec may use sp freely: signals on this (emulation) thread go to their own stack */
+        static u8 altstk[65536] __attribute__((aligned(16)));
+        struct { void *sp; int flags; unsigned long size; } ss = { altstk, 0, sizeof altstk };
+        sigaltstack(&ss, 0);
+        setitimer(2, it, 0);
+        samp_on = 2;
+    }
+}
+static void samp_copy(const char *from, int to)
+{
+    char buf[1024];
+    long k;
+    int fd = open(from, 0);
+    if (fd < 0)
+        return;
+    while ((k = read(fd, buf, sizeof buf)) > 0)
+        write(to, buf, k);
+    close(fd);
+}
+static void samp_write(void)
+{
+    long it[4] = { 0, 0, 0, 0 };
+    u32 n, i, j, tids[64], nt = 0;
+    int fd;
+    char path[64];
+    if (!samp_on)
+        return;
+    setitimer(2, it, 0);
+    n = samp_n < SAMPMAX ? samp_n : SAMPMAX;
+    fd = open("/mnt/SDCARD/drastic_teste/samples.bin", 0x241, 0666);   /* O_WRONLY|O_CREAT|O_TRUNC */
+    if (fd >= 0) {
+        write(fd, &n, 4);
+        write(fd, samp, n * 12);
+        close(fd);
+    }
+    fd = open("/mnt/SDCARD/drastic_teste/samples_maps.txt", 0x241, 0666);
+    if (fd < 0)
+        return;
+    samp_copy("/proc/self/maps", fd);
+    for (i = 0; i < n; i++) {
+        for (j = 0; j < nt && tids[j] != samp[i][2]; j++)
+            ;
+        if (j == nt && nt < 64)
+            tids[nt++] = samp[i][2];
+    }
+    for (j = 0; j < nt; j++) {
+        char *p = path, *q = "/proc/self/task/";
+        u32 t = tids[j], d = 1000000000, z = 0;
+        while (*q) *p++ = *q++;
+        for (; d; d /= 10) { u32 c = t / d % 10; if (c || z || d == 1) { *p++ = '0' + c; z = 1; } }
+        q = "/comm";
+        while (*q) *p++ = *q++;
+        *p = 0;
+        write(fd, "TID ", 4);
+        write(fd, path + 16, p - path - 21);
+        write(fd, " ", 1);
+        samp_copy(path, fd);
+    }
+    close(fd);
+}
+
+static void f3d_setup(void)
+{
+    char *e = getenv("DSFAST_FAST3D");
+    if (!e || (*e < '1' || *e > '8') || *(u32 *)FN_FLUSH_4X != 0xe16d42f4u || *(u32 *)(FN_FLUSH_4X + 4) != 0xe1cd60f8u)
+        return;
+    f3d_mode = *e - '0';
+    f3d_timed = f3d_mode >= 5 && f3d_mode <= 7;
+    { char *k = getenv("DSFAST_F3DCASES"); if (k) { f3d_cases = 0; for (; *k; k++) f3d_cases |= *k == 'e' ? 1 : *k == 'a' ? 2 : *k == 'f' ? 4 : *k == 'b' ? 8 : 0; } }
+    if (f3d_mode == 8) {   /* DSFAST_F3DDUMP: how many calls to record, in thousands */
+        char *k = getenv("DSFAST_F3DDUMP");
+        f3d_dleft = (k && *k >= '1' && *k <= '9') ? (u32)(*k - '0') * 1000 : 2000;
+        f3d_df = log_fopen("/mnt/SDCARD/drastic_teste/f3d_dump.bin", "wb");
+    }
+    { char *k = getenv("DSFAST_F3DSKIP"); if (k && *k >= '0' && *k <= '9') f3d_skip = *k - '0'; }
+    fl4_tramp[0] = *(u32 *)FN_FLUSH_4X;          /* strd r4, r5, [sp, #-36]! */
+    fl4_tramp[1] = *(u32 *)(FN_FLUSH_4X + 4);    /* strd r6, r7, [sp, #8] */
+    fl4_tramp[2] = 0xe51ff004;
+    fl4_tramp[3] = FN_FLUSH_4X + 8;
+    mprotect((void *)((u32)fl4_tramp & ~4095u), 8192, 7);
+    flush_icache(fl4_tramp, fl4_tramp + 4);
+    patch(FN_FLUSH_4X, (void *)f3d_flush);
+}
+static void f3d_write(void)
+{
+    void *f;
+    u32 i;
+    if (f3d_df) {
+        log_fclose(f3d_df);
+        f3d_df = 0;
+    }
+    if (!f3d_mode || !(f = log_fopen("/mnt/SDCARD/Emu/NDS/dsfast_fast3d.txt", "w")))
+        return;
+    log_printf(f, "mode %d: case 0e drawn here %u (checked %u calls, %u rows, %u differing words), "
+               "0e left to DraStic: decal/toon/shadow %u, edge marking %u, no texture %u, odd size %u; other flags %u\n",
+               f3d_mode, f3d_fast, f3d_vcalls, f3d_vrows, f3d_vbad, f3d_why[1], f3d_why[2], f3d_why[3], f3d_why[4], f3d_other);
+    log_printf(f, "alpha (0f/0b): drawn here 0f %u 0b %u; checked %u calls, %u with differences: words 0f %u 0b %u, id bytes %u\n",
+               f3d_acnt[0], f3d_acnt[1], f3d_acalls, f3d_abadc, f3d_aw[0], f3d_aw[1], f3d_aid);
+    if (f3d_timed)
+        log_printf(f, "timed 0e flush (%s): %u calls, %u ms, %u kpixels, %u ns/pixel\n", f3d_mode == 6 ? "ours, 3 passes" : f3d_mode == 7 ? "ours, 1 pass" : "DraStic",
+                   f3d_tn, f3d_tus / 1000, f3d_tpx / 1000, f3d_tpx ? (u32)((float)f3d_tus * 1000.0f / (float)f3d_tpx) : 0);
+    if (f3d_timed)
+        log_printf(f, "stopwatch: %u ns per mono_us() call (2 per timed flush)\n", f3d_tn ? (u32)((float)f3d_tov * 1000.0f / (float)((f3d_tn / 64 + 1) * 65)) : 0);
+    if (f3d_mode == 8)
+        log_printf(f, "recorded %u calls, %u bytes\n", f3d_dn, f3d_dbytes);
+    log_printf(f, "differing words: color %u, depth only bit 30 %u, depth other %u; in fog polygons %u; fog calls checked %u\n",
+               f3d_cbad, f3d_d30, f3d_dother, f3d_badfog, f3d_vfog);
+    for (i = 0; i < 8 && i < f3d_log_n; i++)
+        log_printf(f, "  w0 %08x dw %08x\n", f3d_logw[i][0], f3d_logw[i][1]);
+    for (i = 0; i < 8 && i < f3d_log_n; i++)
+        log_printf(f, "  row %u x %u: color drastic %08x ours %08x, depth drastic %08x ours %08x (attr %08x teximage %08x)\n",
+                   f3d_log[i][0], f3d_log[i][1], f3d_log[i][2], f3d_log[i][3], f3d_log[i][4], f3d_log[i][5], f3d_log[i][6], f3d_log[i][7]);
+    log_fclose(f);
+}
+
 __asm__(
     ".syntax unified\n"
     ".arch armv7-a\n"
@@ -1365,8 +2353,7 @@ __attribute__((constructor)) static void dsfast_init(void)
         const char *no_nice = getenv("DSFAST_NO_NICE");
         if (no_nice && no_nice[0] == '1')
             use_nice = 0;
-        if (use_nice)
-            sys3(97, 0, 0, -5); /* setpriority: keep Core 0 priority above w0 3D helper (nice 0/+5) */
+        nice_tid[0] = (int)sys3(224, 0, 0, 0);   /* gettid: Main; its nice follows the resolution (nice_follow) */
     }
     if (*(u32 *)FN_GET_TICKS_US == 0xe16d40fcu)
         patch(FN_GET_TICKS_US, (void *)dsfast_get_ticks_us);
@@ -1382,6 +2369,10 @@ __attribute__((constructor)) static void dsfast_init(void)
     copy3d_setup();
     neon3d_setup();
     prof_setup();
+    polyprof_setup();
+    f3d_setup();
+    gl_setup();
+    samp_setup();
     blur_setup();
     mhz_start = cpu_mhz();
 }

@@ -24,6 +24,7 @@ device model, real CPU clock, emulation time per frame and frames skipped).
 2. Unzip it to the root of the SD card, replacing files when asked. It contains only:
    - `Emu/NDS/launch.sh` (the Onion launcher with the changes below)
    - `Emu/NDS/libs/libdsfast.so`
+   - `Emu/NDS/libs/libasound.so.2` (sound library with ksielick's fixes: no pop when a game opens or closes)
 3. Play. Saves, save states, layouts and settings are kept.
 
 To go back, put Onion's original `Emu/NDS/launch.sh` back (or reinstall the Onion package) and delete
@@ -87,7 +88,7 @@ The library acts only inside the `drastic` executable and only if it is the exac
 The release library is built with clang (no libc headers needed):
 
 ```
-clang --target=armv7a-linux-gnueabihf -mfloat-abi=hard -O2 -fPIC -shared -nostdlib -fuse-ld=lld \
+clang --target=armv7a-linux-gnueabihf -mfloat-abi=hard -mcpu=cortex-a7 -mfpu=neon-vfpv4 -ffreestanding -O2 -fPIC -shared -nostdlib -fuse-ld=lld \
       -o libdsfast.so dsfast.c dsfast_neon.S
 ```
 
