@@ -860,7 +860,9 @@ static void write_log(void)
                    v[0], v[1], v[2], v[3]);
     }
     log_printf(f, "screen copy (sdl_update_screen): %s, on core 1 %u, on the emulation thread %u\n",
-               copy_mode == 1 ? "on core 1" : copy_mode == 2 ? "kept on the emulation thread" : "not hooked",
+               copy_mode == 1 ? "on core 1" : copy_mode == 2 ? "kept on the emulation thread" :
+               copy_mode == 3 ? "zero-copy SDL, video thread woken at hand-off" :
+               copy_mode == 4 ? "zero-copy SDL, early wake off" : "not hooked",
                us_async, us_sync);
     if (us_async + us_sync)
         log_printf(f, "  time on the emulation thread: average %u us, worst %u us; waits for the copy: %u (%u ms)\n",
@@ -1052,7 +1054,8 @@ int pthread_create(unsigned long *th, void *attr, void *(*fn)(void *), void *arg
 static u8 *sdl_base;
 static void (*orig_update_screen)(void);
 static volatile int copy_busy;
-static int copy_mode;                        /* 0 not set up, 1 on core 1, 2 kept on the emulation thread */
+static int copy_mode;                        /* 0 not set up, 1 on core 1, 2 kept on the emulation thread,
+                                                3 rebuilt libSDL2: video thread woken at the hand-off, 4 same, off */
 static u32 us_async, us_sync, us_main_sum10, us_main_max, copy_waits, copy_wait_us;
 static void copy_wait(void)
 {
@@ -1112,10 +1115,33 @@ static void dsfast_update_screen(void)
     if (d > us_main_max)
         us_main_max = d;
 }
+/* With the rebuilt libSDL2 (zero-copy, mmiyoo_get_nds exported) sdl_update_screen only hands the finished
+   frame to the video thread, but that thread sleeps in usleep(0) (section 3) until system_frame_sync, which
+   in high resolution comes several ms later (rest of the frame, 3D). Measured, GTA CTW hires with the 3D screen
+   shown: 4.5 ms average from hand-off to the start of drawing, and 12% of the frames dropped because the next
+   one came while the video thread was still busy. So wake it right at the hand-off. DSFAST_NO_EARLYWAKE=1: off. */
+static void dsfast_update_screen_wake(void)
+{
+    orig_update_screen();
+    us_sync++;
+    __sync_fetch_and_add(&frame_seq, 1);
+    futex(&frame_seq, 1 | 128, 0x7fffffff, 0);   /* FUTEX_WAKE_PRIVATE */
+}
 /* called every frame until the SDL layer has detoured update_screen */
 static void copy_setup_late(void)
 {
     u32 *p = (u32 *)FN_UPDATE_SCREEN;
+    if (!copy_mode && !sdl_base && sdl_nds && p[0] == 0xe51ff004u && p[1]) {
+        const char *e = getenv("DSFAST_NO_EARLYWAKE");
+        copy_mode = (e && e[0] == '1') ? 4 : 3;
+        if (copy_mode == 3) {
+            orig_update_screen = (void (*)(void))(void *)p[1];
+            mprotect((void *)(FN_UPDATE_SCREEN & ~4095u), 8192, 7);
+            p[1] = (u32)dsfast_update_screen_wake;
+            flush_icache(p, p + 2);
+        }
+        return;
+    }
     if (copy_mode || !sdl_base || p[0] != 0xe51ff004u || p[1] != (u32)(sdl_base + SDL_UPDATE_SCREEN))
         return;
     orig_update_screen = (void (*)(void))(void *)p[1];
