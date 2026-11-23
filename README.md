@@ -1,9 +1,9 @@
 # DraStic for OnionOS, faster (libdsfast)
 
 This fork adds **libdsfast**, a small library loaded by the DraStic launcher on OnionOS / RedOnion
-(Miyoo Mini, Mini Plus, Mini v4, Mini Flip). DraStic r2.5.0.4 and steward-fu's SDL2 layer v1.8 (the build that
-ships with Onion) are **not changed**: the library only replaces the frame limiter, the page flip and a few
-timing details, and places the threads on the two CPU cores.
+(Miyoo Mini, Mini Plus, Mini v4, Mini Flip). DraStic r2.5.0.4 itself is **not changed**: the library replaces the
+frame limiter, the page flip and a few timing and drawing details, and places the threads on the two CPU cores.
+Since Beta 5.1 the zip also ships an updated build of steward-fu's SDL2 layer (by ksielick) and of the ALSA layer.
 
 Result: full speed with **every frame drawn** in normal scenes and smooth frame pacing.
 
@@ -70,13 +70,18 @@ All details, with the measurements behind each one, are in the comments at the t
     are kept between sessions (Beta 4).
 16. **Screen copy off the emulation**: the copy of each finished frame for the video thread runs on the second
     core, so the emulation goes on at once: fewer stutters (Beta 4).
-17. **No screen copy at all** (Beta 5.1, ksielick): the SDL2 layer hands each finished frame straight to the 2D
+17. **Faster high-resolution 3D** (`hires_3d = 1`, Beta 5): the 4x polygon drawing and the vertex lighting
+    redone in NEON (bit-exact), the hidden Engine B skipped, the 3D shared between both cores and thread
+    priorities that apply only in high resolution (ksielick's PRs 6 and 7). GTA Chinatown Wars, recorded drive:
+    2315 -> 3359 frames on screen in 75 s. A delay over 100 ms is dropped instead of being made up by running
+    fast, and the sound resyncs after an 80 ms gap (ksielick's PR 5).
+18. **No screen copy at all** (Beta 5.1, ksielick): the SDL2 layer hands each finished frame straight to the 2D
     accelerator (MI_GFX) from two alternating buffers, in low and high resolution. High resolution with swapped
     screens (`screen_swap = 1`) showed a frozen picture with the old layer; now it is drawn, full screen.
     Mario Kart DS in high resolution, same recorded race: frames on screen 4368 -> 4557 in 80 s, frames shown
     for two refreshes or more halved; GTA Chinatown Wars in high resolution 3613 -> 3785; low resolution the same
     or slightly lighter (9.2 -> 8.0 ms per frame in Mario Kart DS).
-18. **Steady 30 fps pacing** (Beta 5.2, ksielick's PR 4 adapted): when a game alternates a light and a heavy
+19. **Steady 30 fps pacing** (Beta 5.2, ksielick's PR 4 adapted): when a game alternates a light and a heavy
     frame (30-fps games, or manual frameskip 1 in high resolution), the light frame lends its wait to the heavy
     one, so each picture stays two refreshes on screen more evenly. `DSFAST_NO_PAIR30=1` turns it off. No effect
     on 60-fps games (Mario Kart DS at 640x480: no frame affected).
