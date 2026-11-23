@@ -76,6 +76,10 @@ All details, with the measurements behind each one, are in the comments at the t
     Mario Kart DS in high resolution, same recorded race: frames on screen 4368 -> 4557 in 80 s, frames shown
     for two refreshes or more halved; GTA Chinatown Wars in high resolution 3613 -> 3785; low resolution the same
     or slightly lighter (9.2 -> 8.0 ms per frame in Mario Kart DS).
+18. **Steady 30 fps pacing** (Beta 5.2, ksielick's PR 4 adapted): when a game alternates a light and a heavy
+    frame (30-fps games, or manual frameskip 1 in high resolution), the light frame lends its wait to the heavy
+    one, so each picture stays two refreshes on screen more evenly. `DSFAST_NO_PAIR30=1` turns it off. No effect
+    on 60-fps games (Mario Kart DS at 640x480: no frame affected).
 
 The launcher (`launch.sh`) also:
 - sets the CPU clock by model: 1800 MHz on the Mini Plus, 1600 MHz on the Mini v2/v3/v4 and Flip, and puts it back

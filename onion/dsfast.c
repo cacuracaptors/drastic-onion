@@ -384,14 +384,33 @@ static void wait_us(u32 us)
 }
 
 static u32 resync_n, resync_ms;   /* frames that fell >100 ms behind: debt dropped (dsfast.log) */
-static void frame_sync(void *sys)
+/* 30-fps pair pacing (ksielick's PR 4, DSFAST_NO_PAIR30=1 to disable): a 30-fps game alternates a light
+ * frame and a heavy 3D frame; after a light frame, lend up to one refresh of the wait to the heavy frame. */
+static s64 prev_work_us;
+static u32 pair30_score, pair30_lent;
+static int no_pair30;
+static void frame_sync(void *sys, s64 work_us)
 {
     s64 *target = (s64 *)((char *)sys + 0x2aeae50);
     void *audio = (char *)sys + 0x1566000;
     u32 skip_type, skip_value, interval, astate;
     s32 delta;
-    int late;
+    int late, is_30fps;
     s64 t, now, tgt;
+
+    if (work_us > 0 && work_us < 150000) {
+        if ((work_us < 12000 && prev_work_us > 18000) || (work_us > 18000 && prev_work_us < 12000)) {
+            if (pair30_score < 16)
+                pair30_score += 2;
+        } else if (pair30_score > 0) {
+            pair30_score--;
+        }
+        prev_work_us = work_us;
+    } else {
+        pair30_score = 0;
+        prev_work_us = 0;
+    }
+    is_30fps = !no_pair30 && pair30_score >= 6;
 
     interval = CFG(sys, FRAME_INTERVAL);
     astate = audio_buffer_state(audio);
@@ -468,9 +487,15 @@ timer:
         delta = 0;
         late = 1;
     }
-    if (delta > 0)
-        wait_us((u32)delta / 3);
-    else if (delta < -18000)   /* 6 ms late (DraStic: 3 ms), see section 12 */
+    if (delta > 0) {
+        if (is_30fps && work_us > 0 && work_us < 12000) {
+            pair30_lent++;
+            if (delta > (s32)interval)
+                wait_us((u32)(delta - (s32)interval) / 3);
+        } else {
+            wait_us((u32)delta / 3);
+        }
+    } else if (delta < -18000)   /* 6 ms late (DraStic: 3 ms), see section 12 */
         late = 1;
     goto frameskip;
 
@@ -552,12 +577,13 @@ void dsfast_system_frame_sync(void *sys)
     g_sys = sys;
     vs_setup();
     nice_follow();
-    int counted = sync_end_us && t - sync_end_us < 200000;   /* not after a menu or a load */
+    s64 work_us = sync_end_us ? t - sync_end_us : 0;
+    int counted = sync_end_us && work_us < 200000;   /* not after a menu or a load */
     copy_setup_late();
     if (counted)
-        count_work((u32)(t - sync_end_us));
+        count_work((u32)work_us);
     frame_ready();
-    frame_sync(sys);
+    frame_sync(sys, work_us);
     if (F(sys, SKIP_NEXT))
         undrawn_n++;
     if (prof_on)
@@ -841,6 +867,7 @@ static void write_log(void)
                    us_main_sum10 / (us_async + us_sync) * 10, us_main_max, copy_waits, copy_wait_us / 1000);
     log_printf(f, "frames not drawn (frameskip): %u\n", undrawn_n);
     log_printf(f, "fell over 100 ms behind (caught up at once instead of running fast): %u times, %u ms in all\n", resync_n, resync_ms);
+    log_printf(f, "30-fps pair pacing: %s, light frames that lent their wait: %u\n", no_pair30 ? "off" : "on", pair30_lent);
     if (prof_on) {
         int k;
         for (k = 1; k >= 0; k--) {
@@ -1225,6 +1252,9 @@ static void hide_setup(void)
     int *(*get_nds)(void) = (int *(*)(void))dlsym((void *)0, "mmiyoo_get_nds");
     u8 *init = (u8 *)dlsym((void *)0, "SDL_Init");
     const char *noeb = getenv("DSFAST_NO_SKIPEB");
+    const char *nop30 = getenv("DSFAST_NO_PAIR30");
+    if (nop30 && nop30[0] == '1')
+        no_pair30 = 1;
     if (noeb && noeb[0] == '1')
         no_skipeb = 1;
     if (get_dm)
