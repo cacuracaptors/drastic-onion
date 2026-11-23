@@ -553,6 +553,7 @@ static void *g_sys;
 /* diagnostics for dsfast.log (section 14): emulation time per frame, frames not drawn */
 static s64 sync_end_us;
 static u32 work_n, work_sum10, work_max, work_hist[5], undrawn_n, work_ms[64];
+static u32 sync_count, handoff_sync, ew_woken, ew_left;   /* early wake (copy_mode 3), see dsfast_update_screen_wake */
 static void copy_setup_late(void);    /* section 16 */
 static int copy_mode;
 static u32 us_async, us_sync, us_main_sum10, us_main_max, copy_waits, copy_wait_us;
@@ -583,6 +584,7 @@ void dsfast_system_frame_sync(void *sys)
     if (counted)
         count_work((u32)work_us);
     frame_ready();
+    sync_count++;
     frame_sync(sys, work_us);
     if (F(sys, SKIP_NEXT))
         undrawn_n++;
@@ -867,6 +869,9 @@ static void write_log(void)
     if (us_async + us_sync)
         log_printf(f, "  time on the emulation thread: average %u us, worst %u us; waits for the copy: %u (%u ms)\n",
                    us_main_sum10 / (us_async + us_sync) * 10, us_main_max, copy_waits, copy_wait_us / 1000);
+    if (copy_mode == 3)
+        log_printf(f, "  video thread woken at the hand-off: %u, left to the end of the frame (frame before skipped): %u\n",
+                   ew_woken, ew_left);
     log_printf(f, "frames not drawn (frameskip): %u\n", undrawn_n);
     log_printf(f, "fell over 100 ms behind (caught up at once instead of running fast): %u times, %u ms in all\n", resync_n, resync_ms);
     log_printf(f, "30-fps pair pacing: %s, light frames that lent their wait: %u\n", no_pair30 ? "off" : "on", pair30_lent);
@@ -1119,13 +1124,22 @@ static void dsfast_update_screen(void)
    frame to the video thread, but that thread sleeps in usleep(0) (section 3) until system_frame_sync, which
    in high resolution comes several ms later (rest of the frame, 3D). Measured, GTA CTW hires with the 3D screen
    shown: 4.5 ms average from hand-off to the start of drawing, and 12% of the frames dropped because the next
-   one came while the video thread was still busy. So wake it right at the hand-off. DSFAST_NO_EARLYWAKE=1: off. */
+   one came while the video thread was still busy. So wake it right at the hand-off. Only when the frame before
+   was drawn too: after a skipped frame (manual frameskip 1, 30-fps pair pacing) the next hand-off is 33 ms away,
+   and drawing during the heavy frame instead of after it cost pair pacing its gain (GTA CTW hires, frameskip 1:
+   flips of 2 refreshes 468 -> 380). Called on the emulation thread, like dsfast_system_frame_sync.
+   DSFAST_NO_EARLYWAKE=1: off. */
 static void dsfast_update_screen_wake(void)
 {
     orig_update_screen();
-    us_sync++;
-    __sync_fetch_and_add(&frame_seq, 1);
-    futex(&frame_seq, 1 | 128, 0x7fffffff, 0);   /* FUTEX_WAKE_PRIVATE */
+    if (sync_count - handoff_sync <= 1) {
+        ew_woken++;
+        __sync_fetch_and_add(&frame_seq, 1);
+        futex(&frame_seq, 1 | 128, 0x7fffffff, 0);   /* FUTEX_WAKE_PRIVATE */
+    } else {
+        ew_left++;
+    }
+    handoff_sync = sync_count;
 }
 /* called every frame until the SDL layer has detoured update_screen */
 static void copy_setup_late(void)
