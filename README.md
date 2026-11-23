@@ -25,10 +25,12 @@ device model, real CPU clock, emulation time per frame and frames skipped).
    - `Emu/NDS/launch.sh` (the Onion launcher with the changes below)
    - `Emu/NDS/libs/libdsfast.so`
    - `Emu/NDS/libs/libasound.so.2` (sound library with ksielick's fixes: no pop when a game opens or closes)
+   - `Emu/NDS/libs/libSDL2-2.0.so.0` (DraStic's SDL2 layer with ksielick's changes: no screen copy per frame,
+     high resolution with swapped screens fixed)
 3. Play. Saves, save states, layouts and settings are kept.
 
-To go back, put Onion's original `Emu/NDS/launch.sh` back (or reinstall the Onion package) and delete
-`Emu/NDS/libs/libdsfast.so`.
+To go back, reinstall the Onion package (it puts back the original `launch.sh`, `libSDL2-2.0.so.0` and
+`libasound.so.2`) and delete `Emu/NDS/libs/libdsfast.so`.
 
 ## Measured (Mario Kart DS, recorded race replayed with DraStic's own input recording)
 
@@ -68,6 +70,12 @@ All details, with the measurements behind each one, are in the comments at the t
     are kept between sessions (Beta 4).
 16. **Screen copy off the emulation**: the copy of each finished frame for the video thread runs on the second
     core, so the emulation goes on at once: fewer stutters (Beta 4).
+17. **No screen copy at all** (Beta 5.1, ksielick): the SDL2 layer hands each finished frame straight to the 2D
+    accelerator (MI_GFX) from two alternating buffers, in low and high resolution. High resolution with swapped
+    screens (`screen_swap = 1`) showed a frozen picture with the old layer; now it is drawn, full screen.
+    Mario Kart DS in high resolution, same recorded race: frames on screen 4368 -> 4557 in 80 s, frames shown
+    for two refreshes or more halved; GTA Chinatown Wars in high resolution 3613 -> 3785; low resolution the same
+    or slightly lighter (9.2 -> 8.0 ms per frame in Mario Kart DS).
 
 The launcher (`launch.sh`) also:
 - sets the CPU clock by model: 1800 MHz on the Mini Plus, 1600 MHz on the Mini v2/v3/v4 and Flip, and puts it back
@@ -92,6 +100,13 @@ clang --target=armv7a-linux-gnueabihf -mfloat-abi=hard -mcpu=cortex-a7 -mfpu=neo
       -o libdsfast.so dsfast.c dsfast_neon.S
 ```
 
+The SDL2 layer (`sdl2/`) is built with the Miyoo Mini GCC 8.3 toolchain
+([shauninman v0.0.3](https://github.com/shauninman/miyoomini-toolchain-buildroot/releases/tag/v0.0.3)):
+`make -C detour MOD=mmiyoo`, then in `sdl2/` `./autogen.sh`, `MOD=mmiyoo ./configure --host=arm-linux`
+with the video, audio and input backends other than mmiyoo disabled, and `make`. libdsfast finds the layer's data
+through the `mmiyoo_get_nds`, `mmiyoo_get_dis_mode` and `mmiyoo_get_down_scale` exports (with the stock v1.8 layer
+it falls back to fixed offsets).
+
 ## Credits
 
 - DraStic by Exophase.
@@ -102,6 +117,8 @@ clang --target=armv7a-linux-gnueabihf -mfloat-abi=hard -mcpu=cortex-a7 -mfpu=neo
 - libdsfast by Régis ([cacuracaptors](https://github.com/cacuracaptors)), with Claude.
 - Long-session freeze fix (Beta 2) by Kmieciu4ever.
 - CPU clock restored on exit (Beta 3.1) by [ksielick](https://github.com/ksielick).
+- Sound fixes, NEON kernels, high-resolution thread priorities and work-stealing (Beta 5), and the zero-copy SDL2
+  layer (Beta 5.1) by [ksielick](https://github.com/ksielick).
 
 ## License
 
