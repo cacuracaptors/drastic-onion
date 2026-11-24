@@ -89,6 +89,12 @@ All details, with the measurements behind each one, are in the comments at the t
     while in high resolution used to save the default layout (display 8) in `settings.json`, so the next game in
     low resolution lost the layout chosen in the menu. The SDL2 layer now saves the low-resolution layout that was
     in use before high resolution.
+21. **Video thread woken at the frame hand-off** (Beta 5.4, ksielick's PR 9): with the SDL2 layer of Beta 5.1 the
+    thread that puts each frame on screen used to wait for the end of the emulated frame before starting; it now
+    starts as soon as the frame is handed over, when the frame before was drawn too (so manual frameskip 1 and the
+    30-fps pacing are unchanged). `DSFAST_NO_EARLYWAKE=1` turns it off. GTA Chinatown Wars in high resolution,
+    frameskip 0, same recorded drive (2 rounds of 80 s): 4541 / 4525 -> 4572 / 4575 frames on screen; frameskip 1
+    and Mario Kart DS at 640x480 unchanged.
 
 The launcher (`launch.sh`) also:
 - sets the CPU clock by model: 1800 MHz on the Mini Plus, 1600 MHz on the Mini v2/v3/v4 and Flip, and puts it back
