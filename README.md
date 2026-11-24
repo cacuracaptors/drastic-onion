@@ -85,6 +85,10 @@ All details, with the measurements behind each one, are in the comments at the t
     frame (30-fps games, or manual frameskip 1 in high resolution), the light frame lends its wait to the heavy
     one, so each picture stays two refreshes on screen more evenly. `DSFAST_NO_PAIR30=1` turns it off. No effect
     on 60-fps games (Mario Kart DS at 640x480: no frame affected).
+20. **Screen layout kept after high resolution** (Beta 5.3, reported by Successful-Engine-11): closing a game
+    while in high resolution used to save the default layout (display 8) in `settings.json`, so the next game in
+    low resolution lost the layout chosen in the menu. The SDL2 layer now saves the low-resolution layout that was
+    in use before high resolution.
 
 The launcher (`launch.sh`) also:
 - sets the CPU clock by model: 1800 MHz on the Mini Plus, 1600 MHz on the Mini v2/v3/v4 and Flip, and puts it back

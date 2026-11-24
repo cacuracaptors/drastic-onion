@@ -1359,6 +1359,11 @@ int process_drastic_menu(void)
     return 0;
 }
 
+/* Low-resolution layout in use before DraStic switched to high resolution (hires_3d = 1). At file scope so
+ * write_config() can save it: in high resolution nds.dis_mode holds HRES0/HRES1, above NDS_DIS_MODE_LAST,
+ * and settings.json used to get the default layout (VH_S0) instead of the player's choice. */
+static int pre_dis_mode = NDS_DIS_MODE_VH_S0;
+
 static int process_screen(void)
 {
     static int need_loadstate = 15;
@@ -1369,7 +1374,6 @@ static int process_screen(void)
     static int cur_touchpad = 0;
     static int cur_theme_sel = 0;
     static int cur_down_scale = 0;
-    static int pre_dis_mode = NDS_DIS_MODE_VH_S0;
     static int pre_hres_mode = NDS_DIS_MODE_HRES1;
     static char show_info_buf[MAX_PATH << 1] = {0};
 
@@ -2371,8 +2375,14 @@ static int write_config(void)
     }
 
     if (nds.dis_mode > NDS_DIS_MODE_LAST) {
-        nds.dis_mode = NDS_DIS_MODE_VH_S0;
-        nds.alt_mode = NDS_DIS_MODE_S0;
+        if (nds.hres_mode && (pre_dis_mode >= 0) && (pre_dis_mode <= NDS_DIS_MODE_LAST)) {
+            /* closed in high resolution: save the low-resolution layout the player chose */
+            nds.dis_mode = pre_dis_mode;
+        }
+        else {
+            nds.dis_mode = NDS_DIS_MODE_VH_S0;
+            nds.alt_mode = NDS_DIS_MODE_S0;
+        }
     }
 
     json_object_object_add(jfile, JSON_NDS_PEN_SEL, json_object_new_int(nds.pen.sel));
